@@ -54,6 +54,7 @@ export default function SessionSidebar({ onClose }: SessionSidebarProps) {
   const handleDelete = useCallback(
     async (sessionId: string, e: React.MouseEvent) => {
       e.stopPropagation();
+      useAgentStore.getState().clearSessionState(sessionId);
       try {
         await apiFetch(`/api/session/${sessionId}`, { method: 'DELETE' });
         deleteSession(sessionId);
@@ -67,11 +68,11 @@ export default function SessionSidebar({ onClose }: SessionSidebarProps) {
   const handleSelect = useCallback(
     (sessionId: string) => {
       switchSession(sessionId);
-      setPlan([]);
-      clearPanel();
+      // Per-session state (plan, panel, activity) is restored automatically
+      // by SessionChat's useEffect when isActive flips to true.
       onClose?.();
     },
-    [switchSession, setPlan, clearPanel, onClose],
+    [switchSession, onClose],
   );
 
   const formatTime = (d: string) =>

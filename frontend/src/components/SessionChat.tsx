@@ -5,11 +5,10 @@
  * runs — processing events — but only the active session renders visible
  * UI (MessageList + ChatInput).
  */
-import { useCallback, useEffect, useRef } from 'react';
+import { useCallback, useEffect } from 'react';
 import { useAgentChat } from '@/hooks/useAgentChat';
 import { useAgentStore } from '@/store/agentStore';
 import { useSessionStore } from '@/store/sessionStore';
-import { useLayoutStore } from '@/store/layoutStore';
 import MessageList from '@/components/Chat/MessageList';
 import ChatInput from '@/components/Chat/ChatInput';
 import { apiFetch } from '@/utils/api';
@@ -22,7 +21,7 @@ interface SessionChatProps {
 }
 
 export default function SessionChat({ sessionId, isActive, onSessionDead }: SessionChatProps) {
-  const { isConnected, isProcessing, setProcessing, activityStatus } = useAgentStore();
+  const { isConnected, isProcessing, activityStatus, updateSession } = useAgentStore();
   const { updateSessionTitle } = useSessionStore();
 
   const { messages, sendMessage, stop, status, undoLastTurn, approveTools } = useAgentChat({
@@ -33,85 +32,28 @@ export default function SessionChat({ sessionId, isActive, onSessionDead }: Sess
     onSessionDead,
   });
 
-  // When this session becomes active, sync ALL global agentStore state
-  // so the UI correctly reflects this session's current state.
-  // When it becomes inactive, clear global state so the next session starts clean.
-  const prevActiveRef = useRef(isActive);
+  // When this session becomes active, restore its per-session state to the
+  // global flat fields. The per-session state map is kept up-to-date by
+  // side-channel callbacks even while the session is in the background.
   useEffect(() => {
-    if (isActive && !prevActiveRef.current) {
-      // ── Becoming active: restore this session's state ──
-      const store = useAgentStore.getState();
-
-      // SSE transport has no persistent connection — always connected
-      store.setConnected(true);
-
-      // Check if this session has pending approvals in its messages
-      const lastAssistant = [...messages].reverse().find(m => m.role === 'assistant');
-      const hasPendingApproval = lastAssistant?.parts.some(
-        (p) => p.type === 'dynamic-tool' && p.state === 'approval-requested'
-      ) ?? false;
-      const hasApprovedRunning = lastAssistant?.parts.some(
-        (p) => p.type === 'dynamic-tool' && p.state === 'approval-responded'
-      ) ?? false;
-
-      if (hasPendingApproval) {
-        store.setActivityStatus({ type: 'waiting-approval' });
-        store.setProcessing(false);
-
-        // Restore panel for the first pending tool
-        const pendingTool = lastAssistant!.parts.find(
-          (p) => p.type === 'dynamic-tool' && p.state === 'approval-requested'
-        );
-        if (pendingTool && pendingTool.type === 'dynamic-tool') {
-          const args = pendingTool.input as Record<string, string | undefined>;
-          if (pendingTool.toolName === 'hf_jobs' && args?.script) {
-            store.setPanel(
-              { title: 'Script', script: { content: args.script, language: 'python' }, parameters: pendingTool.input as Record<string, unknown> },
-              'script',
-              true,
-            );
-          } else if (pendingTool.toolName === 'hf_repo_files' && args?.content) {
-            const filename = args.path || 'file';
-            store.setPanel({
-              title: filename.split('/').pop() || 'Content',
-              script: { content: args.content, language: filename.endsWith('.py') ? 'python' : 'text' },
-              parameters: pendingTool.input as Record<string, unknown>,
-            });
-          } else {
-            store.setPanel({
-              title: pendingTool.toolName,
-              output: { content: JSON.stringify(pendingTool.input, null, 2), language: 'json' },
-            }, 'output');
-          }
-          useLayoutStore.getState().setRightPanelOpen(true);
-        }
-      } else if (hasApprovedRunning) {
-        // Tools were approved but still executing — show processing state
-        store.setActivityStatus({ type: 'tool', toolName: 'running' });
-        store.setProcessing(true);
-      } else {
-        // Check if any tools are still running (non-approval tools like bash, read, etc.)
-        const runningTool = lastAssistant?.parts.find(
-          (p) => p.type === 'dynamic-tool' && (p.state === 'input-available' || p.state === 'input-streaming')
-        );
-        if (runningTool && runningTool.type === 'dynamic-tool') {
-          const desc = (runningTool.input as Record<string, unknown>)?.description as string | undefined;
-          store.setActivityStatus({ type: 'tool', toolName: runningTool.toolName, description: desc });
-          store.setProcessing(true);
-        } else {
-          store.setActivityStatus({ type: 'idle' });
-          store.setProcessing(false);
-        }
-      }
-    } else if (!isActive && prevActiveRef.current) {
-      // ── Becoming inactive: clear global state so the next session starts clean ──
-      const store = useAgentStore.getState();
-      store.setActivityStatus({ type: 'idle' });
-      store.setProcessing(false);
-      store.clearPanel();
+    if (isActive) {
+      useAgentStore.getState().switchActiveSession(sessionId);
+      useAgentStore.getState().setConnected(true);
     }
-    prevActiveRef.current = isActive;
-  }, [isActive, messages]);
+  }, [isActive, sessionId]);
+
+  // Re-sync state when the browser tab regains focus (Chrome throttles
+  // timers in background tabs which can stall the AI SDK's update flushing).
+  useEffect(() => {
+    if (!isActive) return;
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') {
+        useAgentStore.getState().switchActiveSession(sessionId);
+      }
+    };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => document.removeEventListener('visibilitychange', onVisible);
+  }, [isActive, sessionId]);
 
   // SDK status is the ground truth — if it's streaming/submitted, agent is busy
   const sdkBusy = status === 'streaming' || status === 'submitted';
@@ -121,7 +63,7 @@ export default function SessionChat({ sessionId, isActive, onSessionDead }: Sess
     async (text: string) => {
       if (!text.trim() || busy) return;
 
-      setProcessing(true);
+      updateSession(sessionId, { isProcessing: true });
       sendMessage({ text: text.trim(), metadata: { createdAt: new Date().toISOString() } });
 
       // Auto-title the session from the first user message
@@ -141,7 +83,7 @@ export default function SessionChat({ sessionId, isActive, onSessionDead }: Sess
           });
       }
     },
-    [sessionId, sendMessage, messages, updateSessionTitle, busy, setProcessing],
+    [sessionId, sendMessage, messages, updateSessionTitle, busy, updateSession],
   );
 
   // Don't render UI for background sessions — hooks still run

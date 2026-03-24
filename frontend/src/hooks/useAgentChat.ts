@@ -3,9 +3,9 @@
  * ChatTransport.
  *
  * In the per-session architecture, each session mounts its own instance
- * of this hook. The `isActive` flag controls whether side-channel
- * callbacks update the global UI stores (agentStore / layoutStore) or
- * only per-session metadata (sessionStore.needsAttention).
+ * of this hook. Side-channel callbacks always update the session's own
+ * state via `updateSession()`. If the session is currently active, the
+ * store automatically mirrors updates to the flat global fields.
  */
 import { useCallback, useEffect, useMemo, useRef } from 'react';
 import { useChat } from '@ai-sdk/react';
@@ -34,87 +34,87 @@ export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionD
   const isActiveRef = useRef(isActive);
   isActiveRef.current = isActive;
 
-  const {
-    setProcessing,
-    setConnected,
-    setActivityStatus,
-    setError,
-    setPanel,
-    setPanelOutput,
-  } = useAgentStore();
+  const { setNeedsAttention } = useSessionStore();
 
-  const { setRightPanelOpen, setLeftSidebarOpen } = useLayoutStore();
-  const { setSessionActive, setNeedsAttention } = useSessionStore();
+  // Helper: update this session's state (mirrors to globals if active)
+  const updateSession = useAgentStore.getState().updateSession;
 
   // -- Build side-channel callbacks (stable ref) --------------------------
   const sideChannel = useMemo<SideChannelCallbacks>(
     () => ({
       onReady: () => {
+        updateSession(sessionId, { isProcessing: false });
         if (isActiveRef.current) {
-          setConnected(true);
-          setProcessing(false);
+          useAgentStore.getState().setConnected(true);
         }
-        setSessionActive(sessionId, true);
+        useSessionStore.getState().setSessionActive(sessionId, true);
         callbacksRef.current.onReady?.();
       },
       onShutdown: () => {
+        updateSession(sessionId, { isProcessing: false });
         if (isActiveRef.current) {
-          setConnected(false);
-          setProcessing(false);
+          useAgentStore.getState().setConnected(false);
         }
       },
       onError: (error: string) => {
+        updateSession(sessionId, { isProcessing: false });
         if (isActiveRef.current) {
-          setError(error);
-          setProcessing(false);
+          useAgentStore.getState().setError(error);
         }
         callbacksRef.current.onError?.(error);
       },
       onProcessing: () => {
-        if (isActiveRef.current) {
-          setProcessing(true);
-          setActivityStatus({ type: 'thinking' });
-        }
+        updateSession(sessionId, {
+          isProcessing: true,
+          activityStatus: { type: 'thinking' },
+        });
       },
       onProcessingDone: () => {
-        if (isActiveRef.current) {
-          setProcessing(false);
-        }
+        updateSession(sessionId, { isProcessing: false });
       },
       onUndoComplete: () => {
-        // Undo is handled client-side in undoLastTurn(). With SSE, undo_complete
-        // events are discarded (no subscriber listening between turns).
-        if (isActiveRef.current) setProcessing(false);
+        updateSession(sessionId, { isProcessing: false });
       },
       onCompacted: (oldTokens: number, newTokens: number) => {
         logger.log(`Context compacted: ${oldTokens} -> ${newTokens} tokens`);
       },
       onPlanUpdate: (plan) => {
-        if (!isActiveRef.current) return;
-        useAgentStore.getState().setPlan(plan as Array<{ id: string; content: string; status: 'pending' | 'in_progress' | 'completed' }>);
-        if (!useLayoutStore.getState().isRightPanelOpen) {
-          setRightPanelOpen(true);
+        const typed = plan as Array<{ id: string; content: string; status: 'pending' | 'in_progress' | 'completed' }>;
+        updateSession(sessionId, { plan: typed });
+        if (isActiveRef.current && !useLayoutStore.getState().isRightPanelOpen) {
+          useLayoutStore.getState().setRightPanelOpen(true);
         }
       },
       onToolLog: (tool: string, log: string) => {
-        if (!isActiveRef.current) return;
-        if (tool === 'hf_jobs' || tool === 'sandbox') {
-          const state = useAgentStore.getState();
-          const existingOutput = state.panelData?.output?.content || '';
-          const header = tool === 'sandbox' ? '--- Sandbox creation ---' : '--- Job execution started ---';
-          const newContent = existingOutput
-            ? existingOutput + '\n' + log
-            : header + '\n' + log;
+        const STREAMABLE_TOOLS = new Set(['hf_jobs', 'sandbox', 'bash']);
+        if (!STREAMABLE_TOOLS.has(tool)) return;
 
-          setPanelOutput({ content: newContent, language: 'text' });
+        const sessState = useAgentStore.getState().getSessionState(sessionId);
+        const existingOutput = sessState.panelData?.output?.content || '';
 
-          if (!useLayoutStore.getState().isRightPanelOpen) {
-            setRightPanelOpen(true);
-          }
+        const newContent = existingOutput
+          ? existingOutput + '\n' + log
+          : log;
+
+        if (!sessState.panelData) {
+          const title = tool === 'bash' ? 'Sandbox' : tool === 'sandbox' ? 'Sandbox' : 'Job Output';
+          updateSession(sessionId, {
+            panelData: { title, output: { content: newContent, language: 'text' } },
+            panelView: 'output',
+          });
+        } else {
+          updateSession(sessionId, {
+            panelData: { ...sessState.panelData, output: { content: newContent, language: 'text' } },
+            panelView: 'output',
+          });
+        }
+
+        if (isActiveRef.current && !useLayoutStore.getState().isRightPanelOpen) {
+          useLayoutStore.getState().setRightPanelOpen(true);
         }
       },
       onConnectionChange: (connected: boolean) => {
-        if (isActiveRef.current) setConnected(connected);
+        if (isActiveRef.current) useAgentStore.getState().setConnected(connected);
       },
       onSessionDead: (deadSessionId: string) => {
         logger.warn(`Session ${deadSessionId} dead, removing`);
@@ -123,66 +123,105 @@ export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionD
       onApprovalRequired: (tools) => {
         if (!tools.length) return;
         setNeedsAttention(sessionId, true);
-        if (!isActiveRef.current) return;
 
-        setActivityStatus({ type: 'waiting-approval' });
+        updateSession(sessionId, { activityStatus: { type: 'waiting-approval' } });
+
+        // Build panel data for this session's pending approval
         const firstTool = tools[0];
         const args = firstTool.arguments as Record<string, string | undefined>;
 
+        let panelUpdate: Partial<import('@/store/agentStore').PerSessionState> | undefined;
         if (firstTool.tool === 'hf_jobs' && args.script) {
-          setPanel(
-            { title: 'Script', script: { content: args.script, language: 'python' }, parameters: firstTool.arguments as Record<string, unknown> },
-            'script',
-            true,
-          );
+          panelUpdate = {
+            panelData: {
+              title: 'Script',
+              script: { content: args.script, language: 'python' },
+              parameters: firstTool.arguments as Record<string, unknown>,
+            },
+            panelView: 'script' as const,
+            panelEditable: true,
+          };
         } else if (firstTool.tool === 'hf_repo_files' && args.content) {
           const filename = args.path || 'file';
-          setPanel({
-            title: filename.split('/').pop() || 'Content',
-            script: { content: args.content, language: filename.endsWith('.py') ? 'python' : 'text' },
-            parameters: firstTool.arguments as Record<string, unknown>,
-          });
+          panelUpdate = {
+            panelData: {
+              title: filename.split('/').pop() || 'Content',
+              script: { content: args.content, language: filename.endsWith('.py') ? 'python' : 'text' },
+              parameters: firstTool.arguments as Record<string, unknown>,
+            },
+          };
         } else {
-          setPanel({
-            title: firstTool.tool,
-            output: { content: JSON.stringify(firstTool.arguments, null, 2), language: 'json' },
-          }, 'output');
+          panelUpdate = {
+            panelData: {
+              title: firstTool.tool,
+              output: { content: JSON.stringify(firstTool.arguments, null, 2), language: 'json' },
+            },
+            panelView: 'output' as const,
+          };
         }
+        if (panelUpdate) updateSession(sessionId, panelUpdate);
 
-        setRightPanelOpen(true);
-        setLeftSidebarOpen(false);
+        if (isActiveRef.current) {
+          useLayoutStore.getState().setRightPanelOpen(true);
+          useLayoutStore.getState().setLeftSidebarOpen(false);
+        }
       },
       onToolCallPanel: (toolName: string, args: Record<string, unknown>) => {
-        if (!isActiveRef.current) return;
         if (toolName === 'hf_jobs' && args.operation && args.script) {
-          setPanel(
-            { title: 'Script', script: { content: String(args.script), language: 'python' }, parameters: args },
-            'script',
-          );
-          setRightPanelOpen(true);
-          setLeftSidebarOpen(false);
-        } else if (toolName === 'hf_repo_files' && args.operation === 'upload' && args.content) {
-          setPanel({
-            title: `File Upload: ${String(args.path || 'unnamed')}`,
-            script: { content: String(args.content), language: String(args.path || '').endsWith('.py') ? 'python' : 'text' },
-            parameters: args,
+          updateSession(sessionId, {
+            panelData: {
+              title: 'Script',
+              script: { content: String(args.script), language: 'python' },
+              parameters: args,
+            },
+            panelView: 'script',
           });
-          setRightPanelOpen(true);
-          setLeftSidebarOpen(false);
+          if (isActiveRef.current) {
+            useLayoutStore.getState().setRightPanelOpen(true);
+            useLayoutStore.getState().setLeftSidebarOpen(false);
+          }
+        } else if (toolName === 'hf_repo_files' && args.operation === 'upload' && args.content) {
+          updateSession(sessionId, {
+            panelData: {
+              title: `File Upload: ${String(args.path || 'unnamed')}`,
+              script: { content: String(args.content), language: String(args.path || '').endsWith('.py') ? 'python' : 'text' },
+              parameters: args,
+            },
+          });
+          if (isActiveRef.current) {
+            useLayoutStore.getState().setRightPanelOpen(true);
+            useLayoutStore.getState().setLeftSidebarOpen(false);
+          }
+        } else if (toolName === 'bash' && args.command) {
+          updateSession(sessionId, {
+            panelData: {
+              title: 'Sandbox',
+              script: { content: String(args.command), language: 'bash' },
+            },
+            panelView: 'output',
+          });
         }
       },
       onToolOutputPanel: (toolName: string, _toolCallId: string, output: string, success: boolean) => {
-        if (!isActiveRef.current) return;
+        const sessState = useAgentStore.getState().getSessionState(sessionId);
         if (toolName === 'hf_jobs' && output) {
-          setPanelOutput({ content: output, language: 'markdown' });
-          if (!success) useAgentStore.getState().setPanelView('output');
+          updateSession(sessionId, {
+            panelData: sessState.panelData
+              ? { ...sessState.panelData, output: { content: output, language: 'markdown' } }
+              : { title: 'Output', output: { content: output, language: 'markdown' } },
+            panelView: !success ? 'output' : sessState.panelView,
+          });
+        } else if (toolName === 'bash') {
+          if (!success) {
+            updateSession(sessionId, { panelView: 'output' });
+          }
         }
       },
       onStreaming: () => {
-        if (isActiveRef.current) setActivityStatus({ type: 'streaming' });
+        updateSession(sessionId, { activityStatus: { type: 'streaming' } });
       },
       onToolRunning: (toolName: string, description?: string) => {
-        if (isActiveRef.current) setActivityStatus({ type: 'tool', toolName, description });
+        updateSession(sessionId, { activityStatus: { type: 'tool', toolName, description } });
       },
     }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -232,9 +271,9 @@ export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionD
     sendAutomaticallyWhen: lastAssistantMessageIsCompleteWithApprovalResponses,
     onError: (error) => {
       logger.error('useChat error:', error);
+      updateSession(sessionId, { isProcessing: false });
       if (isActiveRef.current) {
-        setError(error.message);
-        setProcessing(false);
+        useAgentStore.getState().setError(error.message);
       }
     },
   });
@@ -316,11 +355,11 @@ export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionD
         setMsgs(updated);
         saveMessages(sessionId, updated);
       }
-      if (isActiveRef.current) setProcessing(false);
+      updateSession(sessionId, { isProcessing: false });
     } catch (e) {
       logger.error('Undo failed:', e);
     }
-  }, [sessionId, setProcessing]);
+  }, [sessionId, updateSession]);
 
   // -- Approve tools ------------------------------------------------------
   const approveTools = useCallback(
@@ -343,10 +382,12 @@ export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionD
 
       setNeedsAttention(sessionId, false);
       const hasApproved = approvals.some(a => a.approved);
-      if (hasApproved && isActiveRef.current) setProcessing(true);
+      if (hasApproved) {
+        updateSession(sessionId, { isProcessing: true });
+      }
       return true;
     },
-    [sessionId, chat, setProcessing, setNeedsAttention],
+    [sessionId, chat, updateSession, setNeedsAttention],
   );
 
   // -- Stop (abort SSE stream + interrupt backend agent loop) ---------------

@@ -123,6 +123,7 @@ export default function AppLayout() {
 
   const handleSessionDead = useCallback(
     (deadSessionId: string) => {
+      useAgentStore.getState().clearSessionState(deadSessionId);
       deleteSession(deadSessionId);
     },
     [deleteSession],
