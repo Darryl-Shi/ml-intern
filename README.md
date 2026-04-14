@@ -1,22 +1,3 @@
----
-title: ML Agent
-emoji: 🤖
-colorFrom: blue
-colorTo: purple
-sdk: docker
-app_port: 7860
-hf_oauth: true
-hf_oauth_expiration_minutes: 43200
-hf_oauth_scopes:
-  - read-repos
-  - write-repos
-  - contribute-repos
-  - manage-repos
-  - inference-api
-  - jobs
-  - write-discussions
----
-
 # ML Agent
 
 An MLE agent that researches, writes, and ships good quality ML releated code using the Hugging Face ecosystem — with deep access to docs, papers, datasets, and cloud compute.
