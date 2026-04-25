@@ -317,6 +317,7 @@ async def _handle_resume_command(
         trajectory["_resume_path"],
         restored=restore_local_state,
     )
+    await _print_resume_transcript(session)
 
 
 def _derive_turn_count(messages: list, events: list[dict[str, Any]]) -> int:
@@ -374,6 +375,61 @@ def _print_resume_summary(session, resume_path: str | Path, *, restored: bool) -
     )
     if restored:
         console.print("[yellow]Local directory state restored to the latest checkpoint.[/yellow]")
+
+
+def _resume_transcript_items(messages: list[Any]) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for msg in messages:
+        role = getattr(msg, "role", None)
+        content = getattr(msg, "content", None)
+        if role == "system":
+            continue
+        if role == "user" and isinstance(content, str) and content.startswith("[SYSTEM:"):
+            continue
+        if role in {"user", "assistant"}:
+            text = "" if content is None else str(content)
+            if text.strip():
+                items.append({"role": role, "content": text})
+            tool_calls = getattr(msg, "tool_calls", None) or []
+            for tool_call in tool_calls:
+                function = getattr(tool_call, "function", None)
+                name = getattr(function, "name", None) or "tool"
+                items.append({"role": "tool_call", "content": name})
+        elif role == "tool":
+            name = getattr(msg, "name", None) or getattr(msg, "tool_call_id", None) or "tool"
+            text = "" if content is None else str(content)
+            first_line = text.strip().splitlines()[0] if text.strip() else ""
+            items.append(
+                {
+                    "role": "tool",
+                    "content": first_line[:120],
+                    "name": name,
+                }
+            )
+    return items
+
+
+async def _print_resume_transcript(session) -> None:
+    console = get_console()
+    items = _resume_transcript_items(session.context_manager.items)
+    if not items:
+        return
+
+    console.print("\n[bold]Previous conversation[/bold]")
+    for item in items:
+        role = item["role"]
+        content = item["content"]
+        if role == "user":
+            console.print(f"\n[cyan]>[/cyan] {content}")
+        elif role == "assistant":
+            await print_markdown(content, instant=True)
+        elif role == "tool_call":
+            console.print(f"  [tool.name]▸ {content}[/tool.name] [dim](resumed)[/dim]")
+        elif role == "tool":
+            name = item.get("name", "tool")
+            suffix = f": {content}" if content else ""
+            console.print(f"  [dim]↳ {name}{suffix}[/dim]")
+    console.print("[dim]End of resumed conversation.[/dim]\n")
 
 
 def _print_history(session) -> None:
@@ -1274,6 +1330,7 @@ async def main(
                 restore_local_state=restore_local_state,
             )
             _print_resume_summary(session, resume_path, restored=restore_local_state)
+            await _print_resume_transcript(session)
         else:
             session.attach_local_snapshots(os.getcwd())
             session.checkpoint_local_state(label="initial")
