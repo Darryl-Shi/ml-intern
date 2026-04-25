@@ -225,13 +225,9 @@ function createEventToChunkStream(sideChannel: SideChannelCallbacks): TransformS
           const tcId = (event.data?.tool_call_id as string) || '';
           const state = (event.data?.state as string) || '';
           const toolName = (event.data?.tool as string) || '';
-          const jobUrl = (event.data?.jobUrl as string) || undefined;
 
           if (tcId.startsWith('plan_tool')) break;
 
-          if (jobUrl && tcId) {
-            useAgentStore.getState().setJobUrl(tcId, jobUrl);
-          }
           if (state === 'running' && toolName) {
             sideChannel.onToolRunning(toolName);
           }

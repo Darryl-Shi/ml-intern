@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from prompt_toolkit import PromptSession
+from prompt_toolkit.key_binding import KeyBindings
 
 from agent.config import load_config
 from agent.core.agent_loop import submission_loop
@@ -29,9 +30,9 @@ from agent.core.provider import (
     resolve_provider_config,
     save_provider_config,
 )
+from agent.core.message import message_from_mapping
 from agent.core.session import OpType
 from agent.core.tools import ToolRouter
-from agent.utils.reliability_checks import check_training_script_save_pattern
 from agent.utils.terminal_display import (
     get_console,
     print_approval_header,
@@ -50,6 +51,24 @@ from agent.utils.terminal_display import (
     print_turn_complete,
     print_yolo_approve,
 )
+
+_REWIND_SENTINEL = "__ML_INTERN_REWIND__"
+
+
+def _prompt_key_bindings() -> KeyBindings:
+    bindings = KeyBindings()
+
+    @bindings.add("escape", "escape")
+    def _rewind(event) -> None:
+        event.current_buffer.text = _REWIND_SENTINEL
+        event.current_buffer.cursor_position = len(_REWIND_SENTINEL)
+        event.current_buffer.validate_and_handle()
+
+    return bindings
+
+
+_PROMPT_KEY_BINDINGS = _prompt_key_bindings()
+
 
 def _safe_get_args(arguments: dict) -> dict:
     """Safely extract args dict from arguments, handling cases where LLM passes string."""
@@ -153,6 +172,227 @@ class Submission:
 def _create_rich_console():
     """Get the shared rich Console."""
     return get_console()
+
+
+def _load_resume_trajectory(path: str | Path) -> dict[str, Any]:
+    resume_path = Path(path).expanduser().resolve()
+    with open(resume_path, "r") as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError(f"Resume file is not a session trajectory: {resume_path}")
+    data["_resume_path"] = str(resume_path)
+    return data
+
+
+def _derive_turn_count(messages: list, events: list[dict[str, Any]]) -> int:
+    completed = sum(1 for event in events if event.get("event_type") == "turn_complete")
+    if completed:
+        return completed
+    return sum(1 for msg in messages if getattr(msg, "role", None) == "user")
+
+
+def _hydrate_session_from_trajectory(
+    session,
+    trajectory: dict[str, Any],
+    *,
+    restore_local_state: bool = False,
+) -> None:
+    """Load messages/events/checkpoints from a saved trajectory into a session."""
+    resume_path = Path(trajectory["_resume_path"])
+    raw_messages = trajectory.get("messages") or []
+    messages = [
+        message_from_mapping(raw)
+        for raw in raw_messages
+        if isinstance(raw, dict)
+    ]
+    if messages:
+        session.context_manager.items = messages
+
+    session.session_id = trajectory.get("session_id") or session.session_id
+    session.session_start_time = trajectory.get("session_start_time") or session.session_start_time
+    session.logged_events = list(trajectory.get("events") or [])
+    session.turn_count = _derive_turn_count(session.context_manager.items, session.logged_events)
+    session._local_save_path = str(resume_path)
+
+    local_state = trajectory.get("local_state") or {}
+    checkpoints = list(local_state.get("checkpoints") or [])
+    snapshot_root = local_state.get("root") or os.getcwd()
+    session.attach_local_snapshots(snapshot_root, checkpoints)
+
+    if checkpoints:
+        latest_turn = max(int(cp.get("turn_count", 0)) for cp in checkpoints)
+        session.turn_count = max(session.turn_count, latest_turn)
+
+    if restore_local_state:
+        checkpoint = session.latest_local_checkpoint()
+        if checkpoint is None:
+            raise ValueError("Resume file has no local-state checkpoints to restore")
+        session.restore_to_local_checkpoint(checkpoint)
+
+
+def _print_resume_summary(session, resume_path: str | Path, *, restored: bool) -> None:
+    console = get_console()
+    console.print(f"[green]Resumed:[/green] {resume_path}")
+    console.print(
+        f"[dim]Loaded {len(session.context_manager.items)} context item(s), "
+        f"{len(session.local_checkpoints)} local checkpoint(s).[/dim]"
+    )
+    if restored:
+        console.print("[yellow]Local directory state restored to the latest checkpoint.[/yellow]")
+
+
+def _print_history(session) -> None:
+    console = get_console()
+    if session is None:
+        console.print("[yellow]Session is still starting.[/yellow]")
+        return
+    checkpoints = session.local_checkpoints
+    if not checkpoints:
+        console.print("[yellow]No restore checkpoints yet.[/yellow]")
+        return
+    console.print("[bold]Restore points[/bold]")
+    for checkpoint in checkpoints:
+        turn = int(checkpoint.get("turn_count", 0))
+        label = checkpoint.get("label") or f"turn {turn}"
+        message_count = int(checkpoint.get("message_count", 0))
+        preview = ""
+        for msg in reversed(session.context_manager.items[:message_count]):
+            if getattr(msg, "role", None) == "user" and getattr(msg, "content", None):
+                preview = str(msg.content).replace("\n", " ")[:80]
+                break
+        suffix = f" - {preview}" if preview else ""
+        console.print(
+            f"  [cyan]{turn}[/cyan]  {label}  "
+            f"[dim]{message_count} messages{suffix}[/dim]"
+        )
+
+
+def _restore_turn(session, arg: str) -> bool:
+    console = get_console()
+    if session is None:
+        console.print("[yellow]Session is still starting.[/yellow]")
+        return False
+    if not arg:
+        console.print("[yellow]Usage: /restore <turn-number>[/yellow]")
+        return False
+    try:
+        turn = int(arg)
+    except ValueError:
+        console.print(f"[red]Invalid turn number:[/red] {arg}")
+        return False
+    checkpoint = session.local_checkpoint_for_turn(turn)
+    if checkpoint is None:
+        console.print(
+            f"[yellow]No checkpoint for turn {turn}. "
+            "Run /history to list restore points.[/yellow]"
+        )
+        return False
+    session.restore_to_local_checkpoint(checkpoint)
+    if session.config.save_sessions:
+        session.save_and_upload_detached(session.config.session_dataset_repo)
+    console.print(f"[green]Restored to turn {turn}.[/green]")
+    return True
+
+
+def _user_turns(session) -> list[dict[str, Any]]:
+    turns: list[dict[str, Any]] = []
+    if session is None:
+        return turns
+
+    turn = 0
+    for index, msg in enumerate(session.context_manager.items):
+        if index == 0 or getattr(msg, "role", None) != "user":
+            continue
+        content = getattr(msg, "content", "")
+        if not isinstance(content, str) or not content.strip():
+            continue
+        if content.startswith("[SYSTEM:"):
+            continue
+        turn += 1
+        turns.append(
+            {
+                "turn": turn,
+                "message_index": index,
+                "content": content,
+            }
+        )
+    return turns
+
+
+def _print_rewind_choices(session) -> list[dict[str, Any]]:
+    console = get_console()
+    turns = _user_turns(session)
+    if not turns:
+        console.print("[yellow]No prior user messages to rewind.[/yellow]")
+        return []
+
+    console.print("[bold]Rewind to a previous message[/bold]")
+    for item in turns:
+        preview = item["content"].replace("\n", " ")[:90]
+        checkpoint_turn = max(0, int(item["turn"]) - 1)
+        has_checkpoint = session.local_checkpoint_for_turn(checkpoint_turn) is not None
+        marker = "" if has_checkpoint else " [dim](conversation only)[/dim]"
+        console.print(f"  [cyan]{item['turn']}[/cyan]  {preview}{marker}")
+    return turns
+
+
+def _rewind_to_user_turn(session, turn: int) -> str | None:
+    turns = _user_turns(session)
+    selected = next((item for item in turns if item["turn"] == turn), None)
+    if selected is None:
+        return None
+
+    checkpoint_turn = max(0, turn - 1)
+    checkpoint = session.local_checkpoint_for_turn(checkpoint_turn)
+    if checkpoint is not None:
+        session.restore_to_local_checkpoint(checkpoint)
+    else:
+        session.context_manager.items = session.context_manager.items[
+            : selected["message_index"]
+        ]
+        session.turn_count = checkpoint_turn
+
+    if session.config.save_sessions:
+        session.save_and_upload_detached(session.config.session_dataset_repo)
+    return selected["content"]
+
+
+async def _handle_rewind_shortcut(
+    prompt_session: PromptSession,
+    session,
+) -> str | None:
+    console = get_console()
+    turns = _print_rewind_choices(session)
+    if not turns:
+        return None
+
+    latest = str(turns[-1]["turn"])
+    answer = await prompt_session.prompt_async(
+        "Rewind to message (Enter = latest, c = cancel): ",
+        default=latest,
+    )
+    answer = answer.strip()
+    if answer.lower() in {"c", "cancel", "q", "quit"}:
+        console.print("[dim]Rewind cancelled.[/dim]")
+        return None
+    if not answer:
+        answer = latest
+    try:
+        turn = int(answer)
+    except ValueError:
+        console.print(f"[red]Invalid message number:[/red] {answer}")
+        return None
+
+    restored_prompt = _rewind_to_user_turn(session, turn)
+    if restored_prompt is None:
+        console.print(f"[yellow]No message {turn} to rewind to.[/yellow]")
+        return None
+
+    console.print(
+        "[green]Rewound.[/green] "
+        "[dim]The selected message is back in the prompt for editing.[/dim]"
+    )
+    return restored_prompt
 
 
 class _ThinkingShimmer:
@@ -427,58 +667,7 @@ async def event_listener(
                     print_approval_item(i, count, tool_name, operation)
 
                     # Handle different tool types
-                    if tool_name == "hf_jobs":
-                        # Check if this is Python mode (script) or Docker mode (command)
-                        script = arguments.get("script")
-                        command = arguments.get("command")
-
-                        if script:
-                            # Python mode
-                            dependencies = arguments.get("dependencies", [])
-                            python_version = arguments.get("python")
-                            script_args = arguments.get("script_args", [])
-
-                            # Show full script
-                            print(f"Script:\n{script}")
-                            if dependencies:
-                                print(f"Dependencies: {', '.join(dependencies)}")
-                            if python_version:
-                                print(f"Python version: {python_version}")
-                            if script_args:
-                                print(f"Script args: {' '.join(script_args)}")
-
-                            # Run reliability checks on the full script (not truncated)
-                            check_message = check_training_script_save_pattern(script)
-                            if check_message:
-                                print(check_message)
-                        elif command:
-                            # Docker mode
-                            image = arguments.get("image", "python:3.12")
-                            command_str = (
-                                " ".join(command)
-                                if isinstance(command, list)
-                                else str(command)
-                            )
-                            print(f"Docker image: {image}")
-                            print(f"Command: {command_str}")
-
-                        # Common parameters for jobs
-                        hardware_flavor = arguments.get("hardware_flavor", "cpu-basic")
-                        timeout = arguments.get("timeout", "30m")
-                        env = arguments.get("env", {})
-                        schedule = arguments.get("schedule")
-
-                        print(f"Hardware: {hardware_flavor}")
-                        print(f"Timeout: {timeout}")
-
-                        if env:
-                            env_keys = ", ".join(env.keys())
-                            print(f"Environment variables: {env_keys}")
-
-                        if schedule:
-                            print(f"Schedule: {schedule}")
-
-                    elif tool_name == "hf_private_repos":
+                    if tool_name == "hf_private_repos":
                         # Handle private repo operations
                         args = _safe_get_args(arguments)
 
@@ -701,11 +890,15 @@ async def event_listener(
             print(f"Event listener error: {e}")
 
 
-async def get_user_input(prompt_session: PromptSession) -> str:
+async def get_user_input(prompt_session: PromptSession, default: str = "") -> str:
     """Get user input asynchronously"""
     from prompt_toolkit.formatted_text import HTML
 
-    return await prompt_session.prompt_async(HTML("\n<b><cyan>></cyan></b> "))
+    return await prompt_session.prompt_async(
+        HTML("\n<b><cyan>></cyan></b> "),
+        default=default,
+        key_bindings=_PROMPT_KEY_BINDINGS,
+    )
 
 
 # ── Slash command helpers ────────────────────────────────────────────────
@@ -748,6 +941,37 @@ async def _handle_slash_command(
             id=f"sub_{submission_id[0]}",
             operation=Operation(op_type=OpType.COMPACT),
         )
+
+    if command == "/history":
+        _print_history(session_holder[0] if session_holder else None)
+        return None
+
+    if command == "/restore":
+        _restore_turn(session_holder[0] if session_holder else None, arg)
+        return None
+
+    if command == "/rewind":
+        session = session_holder[0] if session_holder else None
+        if arg:
+            restored_prompt = (
+                _rewind_to_user_turn(session, int(arg)) if arg.isdigit() else None
+            )
+            if restored_prompt is None:
+                get_console().print(
+                    f"[yellow]No message {arg} to rewind to. "
+                    "Use Esc Esc for the chooser.[/yellow]"
+                )
+            else:
+                get_console().print(
+                    "[green]Rewound.[/green] "
+                    "[dim]The selected message is back in the prompt for editing.[/dim]"
+                )
+            return restored_prompt
+        _print_rewind_choices(session)
+        get_console().print(
+            "[dim]Use /rewind <message-number>, or press Esc Esc for the chooser.[/dim]"
+        )
+        return None
 
     if command == "/model":
         console = get_console()
@@ -818,14 +1042,19 @@ async def _handle_slash_command(
         if session:
             print(f"Turns: {session.turn_count}")
             print(f"Context items: {len(session.context_manager.items)}")
+            print(f"Restore checkpoints: {len(session.local_checkpoints)}")
         return None
 
     print(f"Unknown command: {command}. Type /help for available commands.")
     return None
 
 
-async def main():
+async def main(
+    resume_path: str | None = None,
+    restore_local_state: bool = False,
+):
     """Interactive chat with the agent"""
+    resume_trajectory = _load_resume_trajectory(resume_path) if resume_path else None
 
     # Clear screen
     os.system("clear" if os.name != "nt" else "cls")
@@ -892,6 +1121,18 @@ async def main():
     )
 
     await ready_event.wait()
+    session = session_holder[0]
+    if session is not None:
+        if resume_path:
+            _hydrate_session_from_trajectory(
+                session,
+                resume_trajectory,
+                restore_local_state=restore_local_state,
+            )
+            _print_resume_summary(session, resume_path, restored=restore_local_state)
+        else:
+            session.attach_local_snapshots(os.getcwd())
+            session.checkpoint_local_state(label="initial")
 
     submission_id = [0]
     # Mirrors codex-rs/tui/src/bottom_pane/mod.rs:137
@@ -902,6 +1143,7 @@ async def main():
     # (`" again to quit"` prefixed with the key binding, rendered dim).
     CTRL_C_HINT = "[dim]ctrl + c again to quit[/dim]"
     interrupt_state = {"last": 0.0, "exit": False}
+    pending_prompt_text = ""
 
     loop = asyncio.get_running_loop()
 
@@ -959,7 +1201,8 @@ async def main():
             # as KeyboardInterrupt here. On return, prompt_toolkit removes the
             # loop's SIGINT handler — we re-arm at the top of the next iter.
             try:
-                user_input = await get_user_input(prompt_session)
+                user_input = await get_user_input(prompt_session, pending_prompt_text)
+                pending_prompt_text = ""
             except EOFError:
                 break
             except KeyboardInterrupt:
@@ -979,6 +1222,15 @@ async def main():
             if user_input.strip().lower() in ["exit", "quit", "/quit", "/exit"]:
                 break
 
+            if user_input == _REWIND_SENTINEL:
+                restored = await _handle_rewind_shortcut(
+                    prompt_session,
+                    session_holder[0] if session_holder else None,
+                )
+                pending_prompt_text = restored or ""
+                turn_complete_event.set()
+                continue
+
             # Skip empty input
             if not user_input.strip():
                 turn_complete_event.set()
@@ -991,6 +1243,10 @@ async def main():
                 )
                 if sub is None:
                     # Command handled locally, loop back for input
+                    turn_complete_event.set()
+                    continue
+                elif isinstance(sub, str):
+                    pending_prompt_text = sub
                     turn_complete_event.set()
                     continue
                 else:
@@ -1042,11 +1298,14 @@ async def headless_main(
     model: str | None = None,
     max_iterations: int | None = None,
     stream: bool = True,
+    resume_path: str | None = None,
+    restore_local_state: bool = False,
 ) -> None:
     """Run a single prompt headlessly and exit."""
     import logging
 
     logging.basicConfig(level=logging.WARNING)
+    resume_trajectory = _load_resume_trajectory(resume_path) if resume_path else None
 
     hf_token = _get_hf_token()
     if hf_token:
@@ -1103,6 +1362,19 @@ async def headless_main(
         event = await event_queue.get()
         if event.event_type == "ready":
             break
+
+    session = session_holder[0]
+    if session is not None:
+        if resume_path:
+            _hydrate_session_from_trajectory(
+                session,
+                resume_trajectory,
+                restore_local_state=restore_local_state,
+            )
+            _print_resume_summary(session, resume_path, restored=restore_local_state)
+        else:
+            session.attach_local_snapshots(os.getcwd())
+            session.checkpoint_local_state(label="initial")
 
     # Submit the prompt
     submission = Submission(
@@ -1244,13 +1516,18 @@ def cli():
     # Suppress whoosh invalid escape sequence warnings (third-party, unfixed upstream)
     warnings.filterwarnings("ignore", category=SyntaxWarning, module="whoosh")
 
-    parser = argparse.ArgumentParser(description="Hugging Face Agent CLI")
+    parser = argparse.ArgumentParser(description="ML Intern CLI")
     parser.add_argument("prompt", nargs="?", default=None, help="Run headlessly with this prompt")
     parser.add_argument("--model", "-m", default=None, help=f"Model to use (default: from config)")
     parser.add_argument("--max-iterations", type=int, default=None,
                         help="Max LLM requests per turn (default: 50, use -1 for unlimited)")
     parser.add_argument("--no-stream", action="store_true",
                         help="Disable token streaming (use non-streaming LLM calls)")
+    parser.add_argument("--resume", default=None,
+                        help="Resume an exact session from a session_logs JSON file")
+    parser.add_argument("--restore-local-state", action="store_true",
+                        help="With --resume, restore the working directory to "
+                             "the latest checkpoint")
     args = parser.parse_args()
 
     try:
@@ -1258,9 +1535,19 @@ def cli():
             max_iter = args.max_iterations
             if max_iter is not None and max_iter < 0:
                 max_iter = 10_000  # effectively unlimited
-            asyncio.run(headless_main(args.prompt, model=args.model, max_iterations=max_iter, stream=not args.no_stream))
+            asyncio.run(headless_main(
+                args.prompt,
+                model=args.model,
+                max_iterations=max_iter,
+                stream=not args.no_stream,
+                resume_path=args.resume,
+                restore_local_state=args.restore_local_state,
+            ))
         else:
-            asyncio.run(main())
+            asyncio.run(main(
+                resume_path=args.resume,
+                restore_local_state=args.restore_local_state,
+            ))
     except KeyboardInterrupt:
         print("\n\nGoodbye!")
 

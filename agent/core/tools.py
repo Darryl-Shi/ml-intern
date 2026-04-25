@@ -45,7 +45,6 @@ from agent.tools.hf_repo_git_tool import (
     HF_REPO_GIT_TOOL_SPEC,
     hf_repo_git_handler,
 )
-from agent.tools.jobs_tool import HF_JOBS_TOOL_SPEC, hf_jobs_handler
 from agent.tools.papers_tool import HF_PAPERS_TOOL_SPEC, hf_papers_handler
 from agent.tools.plan_tool import PLAN_TOOL_SPEC, plan_tool_handler
 from agent.tools.research_tool import RESEARCH_TOOL_SPEC, research_handler
@@ -317,18 +316,12 @@ def create_builtin_tools(local_mode: bool = False) -> list[ToolSpec]:
             parameters=HF_INSPECT_DATASET_TOOL_SPEC["parameters"],
             handler=hf_inspect_dataset_handler,
         ),
-        # Planning and job management tools
+        # Planning
         ToolSpec(
             name=PLAN_TOOL_SPEC["name"],
             description=PLAN_TOOL_SPEC["description"],
             parameters=PLAN_TOOL_SPEC["parameters"],
             handler=plan_tool_handler,
-        ),
-        ToolSpec(
-            name=HF_JOBS_TOOL_SPEC["name"],
-            description=HF_JOBS_TOOL_SPEC["description"],
-            parameters=HF_JOBS_TOOL_SPEC["parameters"],
-            handler=hf_jobs_handler,
         ),
         # HF Repo management tools
         ToolSpec(

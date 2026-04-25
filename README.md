@@ -6,7 +6,7 @@
 
 ML Intern is an agent for ML engineering work. It can research Hugging Face
 docs, papers, models, datasets, and repositories, write code, run local tools,
-launch HF jobs, and keep a resumable session trace while it works.
+run SkyPilot sandboxes on RunPod, and keep a resumable session trace while it works.
 
 The runtime is provider-neutral: bring any OpenAI-compatible chat completions
 endpoint, model name, base URL, and API key. The CLI is the primary interface;
@@ -59,9 +59,8 @@ HF_TOKEN=<your-hugging-face-token>
 GITHUB_TOKEN=<github-personal-access-token>
 ```
 
-Use `HF_TOKEN` for private Hub access, job submission, and authenticated HF API
-calls. Use `GITHUB_TOKEN` for GitHub search or repository operations that need
-auth.
+Use `HF_TOKEN` for private Hub access and authenticated HF API calls. Use
+`GITHUB_TOKEN` for GitHub search or repository operations that need auth.
 
 ## CLI Usage
 
@@ -83,10 +82,42 @@ Common options:
 ml-intern --model gpt-4o-mini "your prompt"
 ml-intern --max-iterations 100 "your prompt"
 ml-intern --no-stream "your prompt"
+ml-intern --resume session_logs/session_<id>_<timestamp>.json
+ml-intern --resume session_logs/session_<id>_<timestamp>.json --restore-local-state
 ```
 
 `--model` changes only the model name for that run. The base URL and API key
 still come from the environment, saved provider file, or interactive setup.
+
+### Resume and Restore
+
+ML Intern saves session trajectories under `session_logs/`. In CLI mode it also
+creates working-directory checkpoints under `session_logs/snapshots/` at the
+start of the session and after each completed turn. The checkpoints exclude
+heavy or generated directories such as `.git`, `.venv`, `node_modules`,
+`__pycache__`, `.pytest_cache`, and `session_logs`.
+
+Resume the exact message history from a prior session:
+
+```bash
+ml-intern --resume session_logs/session_<id>_<timestamp>.json
+```
+
+Resume and restore the local directory to the latest saved checkpoint:
+
+```bash
+ml-intern --resume session_logs/session_<id>_<timestamp>.json --restore-local-state
+```
+
+Inside an interactive session, use `/history` to list restore points and
+`/restore <turn>` to restore both the conversation and local files to that
+turn. `/undo` also rolls the local files back to the previous available
+checkpoint.
+
+For a Codex-style edit/resume flow, press `Esc` twice at the prompt. ML Intern
+shows prior user messages, restores the conversation and local files to just
+before the selected message, and places that message back into the prompt so
+you can edit or resend it. `/rewind <message-number>` is the command fallback.
 
 ### Slash Commands
 
@@ -100,7 +131,11 @@ Inside the CLI:
 | `/model <name>` | Switch the model for the current provider. |
 | `/effort <level>` | Set reasoning effort: `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or `off`. |
 | `/compact` | Summarize older context and continue in the same session. |
-| `/undo` | Remove the last turn from context. |
+| `/undo` | Remove the last turn from context and restore local files to the prior checkpoint. |
+| `/history` | List turn checkpoints available for restore. |
+| `/restore <turn>` | Restore conversation history and local files to a turn checkpoint. |
+| `/rewind <message>` | Rewind to before a prior user message and put it back in the prompt. |
+| `Esc Esc` | Open the rewind chooser. |
 | `/status` | Show model, provider, reasoning effort, turns, and context items. |
 | `/yolo` | Toggle auto-approval for tool calls. |
 | `/help` | Show CLI help. |

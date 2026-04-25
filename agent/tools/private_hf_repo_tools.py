@@ -1,8 +1,8 @@
 """
 Private HF Repos Tool - Manage private Hugging Face repositories
 
-PRIMARY USE: Store job outputs, training scripts, and logs from HF Jobs.
-Since job results are ephemeral, this tool provides persistent storage in private repos.
+PRIMARY USE: Store training outputs, scripts, and logs from remote runs.
+Since remote execution storage is ephemeral, this tool provides persistent storage in private repos.
 
 SECONDARY USE: Read back stored files and list repo contents.
 """
@@ -102,8 +102,8 @@ class PrivateHfRepoTool:
         """Show usage instructions when tool is called with no arguments."""
         usage_text = """# Private HF Repos Tool
 
-**PRIMARY USE:** Store job outputs, scripts, and logs from HF Jobs to private repos.
-Since job results are ephemeral, use this tool for persistent storage.
+**PRIMARY USE:** Store remote run outputs, scripts, and logs to private repos.
+Since remote execution storage is ephemeral, use this tool for persistent storage.
 
 **SECONDARY USE:** Read back stored files and list repo contents.
 
@@ -597,13 +597,13 @@ PRIVATE_HF_REPO_TOOL_SPEC = {
     "name": "hf_private_repos",
     "description": (
         "Manage private HF repositories - create, upload, read, list files in models/datasets/spaces. "
-        "⚠️ PRIMARY USE: Store job outputs persistently (job storage is EPHEMERAL - everything deleted after completion). "
-        "**Use when:** (1) Job completes and need to store logs/scripts/results, (2) Creating repos for training outputs, "
-        "(3) Reading back stored files, (4) Managing Space files, (5) Organizing job artifacts by path. "
-        "**Pattern:** hf_jobs (ephemeral) → hf_private_repos upload_file (persistent) → can read_file later. "
+        "PRIMARY USE: Store remote run outputs persistently (remote storage is EPHEMERAL). "
+        "**Use when:** (1) A run completes and you need to store logs/scripts/results, (2) Creating repos for training outputs, "
+        "(3) Reading back stored files, (4) Managing Space files, (5) Organizing run artifacts by path. "
+        "**Pattern:** sandbox run output -> hf_private_repos upload_file (persistent) -> can read_file later. "
         "ALWAYS pass file_content as string/bytes (✓), never file paths (✗) - this is content-based, no filesystem access. "
         "**Operations:** create_repo (new private repo), upload_file (store content), read_file (retrieve content), list_files (browse), check_repo (verify exists). "
-        "**Critical for reliability:** Jobs lose all files after completion - use this tool to preserve important outputs. "
+        "**Critical for reliability:** Remote runs can lose files - use this tool to preserve important outputs. "
         "Repositories created are ALWAYS private by default (good for sensitive training data/models). "
         "For Spaces: must provide space_sdk ('gradio', 'streamlit', 'static', 'docker') when creating. "
         "**Then:** After uploading, provide user with repository URL for viewing/sharing."

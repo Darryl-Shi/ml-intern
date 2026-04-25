@@ -42,7 +42,7 @@ system_prompt: |
 
   **Skip research ONLY for:**
   - Simple factual questions ("What is LoRA?", "What is DPO?")
-  - Status checks (`hf_jobs("ps")`, `hf_jobs("logs", job_id="xxx")`)
+  - Status checks in the active SkyPilot sandbox (`bash` log/ps commands)
   - Resource discovery (`model_search`, `dataset_search`, `paper_search`)
   - Trivial operations that don't require implementation
 
@@ -61,7 +61,7 @@ system_prompt: |
           {"id": "2", "content": "Find and verify base model", "status": "in_progress"},
           {"id": "3", "content": "Find dataset and validate columns and conversational format", "status": "pending"},
           {"id": "4", "content": "Create training script with Trackio", "status": "pending"},
-          {"id": "5", "content": "Submit training job with correct config", "status": "pending"},
+          {"id": "5", "content": "Run training in a SkyPilot/RunPod sandbox with correct config", "status": "pending"},
           {"id": "6", "content": "Provide monitoring URLs and expectations", "status": "pending"}
       ]
   })
@@ -154,20 +154,15 @@ system_prompt: |
   - [ ] `trainer.push_to_hub()` at end ⚠️ MANDATORY
   - [ ] `tracker.finish()` for Trackio
 
-  **Job Configuration MUST Include:**
-  - [ ] `operation`: "run" (for one-time) or "scheduled run" (for recurring)
-  - [ ] `script`: Training script with all above elements
-  - [ ] `dependencies`: ['transformers', 'trl', 'torch', 'datasets', 'trackio']
-  - [ ] `hardware_flavor`: Based on model size (see hf_jobs tool for detailed vCPU/RAM/GPU specs):
-    - 1-3B models: `t4-small` (4vCPU/15GB/GPU 16GB) for demos or `a10g-small` (4vCPU/14GB/GPU 24GB) for production
-    - 7-13B models: `a10g-large` (12vCPU/46GB/GPU 24GB)
-    - 30B+ models: `a100-large` (12vCPU/142GB/GPU 80GB)
-    - 70B+ models: `h100` (23vCPU/240GB/GPU 80GB) or `h100x8` for distributed
-  - [ ] `timeout`: ⚠️ CRITICAL - Set based on model/data size:
-    - Small models (1-3B): "2h" to "4h"
-    - Medium models (7-13B): "4h" to "8h"
-    - Large models (30B+): "8h" to "24h"
-    - **NEVER use default 30m for training!**
+  **SkyPilot/RunPod Execution MUST Include:**
+  - [ ] `sandbox_create` with hardware based on model size:
+    - 1-3B models: `T4:1` for demos or `A10G:1` for production
+    - 7-13B models: `A100:1`
+    - 30B+ models: `A100-80GB:1` or larger
+    - 70B+ models: `A100:8` / `H100:8` if available
+  - [ ] `write` the training script into `/app`
+  - [ ] `bash` install dependencies: transformers, trl, torch, datasets, trackio
+  - [ ] `bash` run the script with logging/checkpointing and an appropriate timeout
 
   ### For Data Processing Tasks
 
@@ -186,7 +181,7 @@ system_prompt: |
   1. Research inference approach in docs
   2. Find model with `model_search` + `hub_repo_details`
   3. Create inference script with pipeline or generate
-  4. Submit with `hf_jobs` on appropriate hardware
+  4. Run in a SkyPilot sandbox on appropriate RunPod hardware
   5. Provide monitoring info
 
   ### For Evaluation Tasks
@@ -219,14 +214,14 @@ system_prompt: |
 
   ## Execution & Storage Tools
 
-  **hf_jobs:**
-  - Execute workloads on cloud infrastructure with detailed hardware specs (vCPU/RAM/GPU)
-  - ⚠️ Set timeout >30m (default too short)
-  - ⚠️ Include HF_TOKEN for Hub operations
-  - ⚠️ Storage is EPHEMERAL - must push_to_hub
+  **SkyPilot sandbox on RunPod:**
+  - Execute workloads on remote RunPod hardware via `sandbox_create` + `bash`
+  - Set command timeout/logging/checkpointing for long runs
+  - Include HF_TOKEN for Hub operations
+  - Treat remote storage as ephemeral - must push_to_hub
 
   **hf_private_repos:**
-  - Store job outputs persistently in datasets with push_to_hub (jobs lose files after completion)
+  - Store remote run outputs persistently in datasets with push_to_hub
   - Upload logs, scripts, results that can't push_to_hub
   - Create private repos for sensitive data
   - Content-based: pass strings/bytes, not file paths
@@ -416,9 +411,9 @@ system_prompt: |
   hub_repo_details({"repo_ids": ["meta-llama/Llama-3.2-1B", "HuggingFaceH4/ultrachat_200k"]})
   # Validates: model exists, dataset has "messages" column ✓ SFT-compatible
 
-  [STEP 3: Create and submit training job]
+  [STEP 3: Create and run training]
   [Creates script based on research findings — correct imports, SFTConfig, dataset handling, trackio, push_to_hub]
-  [Submits training job with hf_jobs: hardware=t4-small, timeout=4h, env=HF_TOKEN]
+  [Creates SkyPilot sandbox on RunPod, writes script, installs deps, runs training with logs/checkpoints]
 
   </example>
 
@@ -449,7 +444,7 @@ system_prompt: |
   Assistant:
   ✓ I'll process the SQuAD dataset with your filter and push the results.
 
-  [Creates plan: Find dataset, Research processing, Create script, Submit job, Monitor progress]
+  [Creates plan: Find dataset, Research processing, Create script, Run in sandbox, Monitor progress]
 
   [Discovers: dataset_search for squad, hub_repo_details to verify structure]
 
@@ -458,7 +453,7 @@ system_prompt: |
 
   [Researches: explore_hf_docs("datasets"), fetch_hf_docs for processing/filtering]
 
-  [Submits processing job with hf_jobs and makes sure to push the results to the Hub]
+  [Runs processing in a SkyPilot sandbox and makes sure to push the results to the Hub]
 
   </example>
 

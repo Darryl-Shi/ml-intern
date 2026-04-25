@@ -1,10 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Box, Stack, Typography, Chip, Button, TextField, IconButton, Link, CircularProgress } from '@mui/material';
+import { Box, Stack, Typography, Chip, Button, TextField, IconButton, CircularProgress } from '@mui/material';
 import CheckCircleOutlineIcon from '@mui/icons-material/CheckCircleOutline';
 import ErrorOutlineIcon from '@mui/icons-material/ErrorOutline';
 import OpenInNewIcon from '@mui/icons-material/OpenInNew';
 import HourglassEmptyIcon from '@mui/icons-material/HourglassEmpty';
-import LaunchIcon from '@mui/icons-material/Launch';
 import SendIcon from '@mui/icons-material/Send';
 import BlockIcon from '@mui/icons-material/Block';
 import { useAgentStore, type ResearchAgentState } from '@/store/agentStore';
@@ -303,33 +302,17 @@ function InlineApproval({
   toolCallId,
   toolName,
   input,
-  scriptLabel,
   onResolve,
 }: {
   toolCallId: string;
   toolName: string;
   input: unknown;
-  scriptLabel: string;
   onResolve: (toolCallId: string, approved: boolean, feedback?: string) => void;
 }) {
   const [feedback, setFeedback] = useState('');
   const args = input as Record<string, unknown> | undefined;
-  const { setPanel, getEditedScript } = useAgentStore();
-  const { setRightPanelOpen, setLeftSidebarOpen } = useLayoutStore();
+  const { getEditedScript } = useAgentStore();
   const hasEditedScript = !!getEditedScript(toolCallId);
-
-  const handleScriptClick = useCallback(() => {
-    if (toolName === 'hf_jobs' && args?.script) {
-      const scriptContent = getEditedScript(toolCallId) || String(args.script);
-      setPanel(
-        { title: scriptLabel, script: { content: scriptContent, language: 'python' }, parameters: { tool_call_id: toolCallId } },
-        'script',
-        true,
-      );
-      setRightPanelOpen(true);
-      setLeftSidebarOpen(false);
-    }
-  }, [toolCallId, toolName, args, scriptLabel, setPanel, getEditedScript, setRightPanelOpen, setLeftSidebarOpen]);
 
   return (
     <Box sx={{ px: 1.5, py: 1.5, borderTop: '1px solid var(--tool-border)' }}>
@@ -353,85 +336,11 @@ function InlineApproval({
               )}
             </Typography>
             <Typography variant="body2" sx={{ color: 'var(--muted-text)', fontSize: '0.7rem', opacity: 0.7 }}>
-              Creates a temporary HF Space to develop and test scripts before running jobs. Takes 1-2 min to start.
+              Creates a SkyPilot sandbox on RunPod for developing, testing, and running scripts. Takes 1-2 min to start.
             </Typography>
           </Box>
         );
       })()}
-
-      {toolName === 'hf_jobs' && args && (() => {
-        const hw = String(args.hardware_flavor || 'cpu-basic');
-        const cost = costLabel(hw);
-        return (
-        <Box sx={{ mb: 1.5 }}>
-          <Typography variant="body2" sx={{ color: 'var(--muted-text)', fontSize: '0.75rem', mb: 1 }}>
-            Execute <Box component="span" sx={{ color: 'var(--accent-yellow)', fontWeight: 500 }}>{scriptLabel.replace('Script', 'Job')}</Box> on{' '}
-            <Box component="span" sx={{ fontWeight: 500, color: 'var(--text)' }}>
-              {hw}
-            </Box>
-            {cost && (
-              <Box component="span" sx={{ color: cost === 'free' ? 'var(--accent-green)' : 'var(--accent-yellow)', fontWeight: 500 }}>
-                {' '}({cost})
-              </Box>
-            )}
-            {!!args.timeout && (
-              <> for up to <Box component="span" sx={{ fontWeight: 500, color: 'var(--text)' }}>
-                {String(args.timeout)}
-              </Box></>
-            )}
-          </Typography>
-          {typeof args.script === 'string' && args.script && (
-            <Box
-              onClick={handleScriptClick}
-              sx={{
-                mt: 0.5,
-                p: 1.5,
-                bgcolor: 'var(--code-panel-bg)',
-                border: '1px solid var(--tool-border)',
-                borderRadius: '8px',
-                cursor: 'pointer',
-                transition: 'border-color 0.15s ease',
-                '&:hover': { borderColor: 'var(--accent-yellow)' },
-              }}
-            >
-              <Box
-                component="pre"
-                sx={{
-                  m: 0,
-                  fontFamily: '"JetBrains Mono", ui-monospace, SFMono-Regular, monospace',
-                  fontSize: '0.7rem',
-                  lineHeight: 1.5,
-                  color: 'var(--text)',
-                  overflow: 'hidden',
-                  display: '-webkit-box',
-                  WebkitLineClamp: 3,
-                  WebkitBoxOrient: 'vertical',
-                  whiteSpace: 'pre-wrap',
-                  wordBreak: 'break-all',
-                }}
-              >
-                {String(args.script).trim()}
-              </Box>
-              <Typography
-                variant="caption"
-                sx={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: 0.5,
-                  mt: 1,
-                  fontSize: '0.65rem',
-                  color: 'var(--muted-text)',
-                  '&:hover': { color: 'var(--accent-yellow)' },
-                }}
-              >
-                Click to view & edit
-              </Typography>
-            </Box>
-          )}
-        </Box>
-        );
-      })()}
-
       <Box sx={{ display: 'flex', gap: 1, mb: 1 }}>
         <TextField
           fullWidth
@@ -517,7 +426,7 @@ function InlineApproval({
 const EMPTY_AGENTS: Record<string, ResearchAgentState> = {};
 
 export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProps) {
-  const { setPanel, lockPanel, getJobUrl, getEditedScript, setJobStatus, getJobStatus, setToolError, getToolError, setToolRejected, getToolRejected } = useAgentStore();
+  const { setPanel, lockPanel, getEditedScript, setToolError, getToolError, setToolRejected, getToolRejected } = useAgentStore();
   const researchAgents = useAgentStore(s => {
     const activeId = s.activeSessionId;
     return (activeId && s.sessionStates[activeId]?.researchAgents) || EMPTY_AGENTS;
@@ -531,7 +440,7 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
   useSecondTick(anyResearchRunning);
 
   const isProcessing = useAgentStore(s => s.isProcessing);
-  const { setRightPanelOpen, setLeftSidebarOpen } = useLayoutStore();
+  const { setRightPanelOpen } = useLayoutStore();
 
   // ── Batch approval state ──────────────────────────────────────────
   const pendingTools = useMemo(
@@ -589,27 +498,15 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
     }
   }, [tools, setToolError, getToolError]);
 
-  const { scriptLabelMap, toolDisplayMap } = useMemo(() => {
-    const hfJobs = tools.filter(t => t.toolName === 'hf_jobs' && (t.input as Record<string, unknown>)?.script);
-    const scriptMap: Record<string, string> = {};
+  const toolDisplayMap = useMemo(() => {
     const displayMap: Record<string, string> = {};
-    for (let i = 0; i < hfJobs.length; i++) {
-      const id = hfJobs[i].toolCallId;
-      if (hfJobs.length > 1) {
-        scriptMap[id] = `Script ${i + 1}`;
-        displayMap[id] = `hf_jobs #${i + 1}`;
-      } else {
-        scriptMap[id] = 'Script';
-        displayMap[id] = 'hf_jobs';
-      }
-    }
     // Pretty name for research tool
     for (const t of tools) {
       if (t.toolName === 'research') {
         displayMap[t.toolCallId] = 'research';
       }
     }
-    return { scriptLabelMap: scriptMap, toolDisplayMap: displayMap };
+    return displayMap;
   }, [tools]);
 
   // ── Send all decisions as a single batch ──────────────────────────
@@ -689,24 +586,6 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
       const args = tool.input as Record<string, unknown> | undefined;
       const displayName = toolDisplayMap[tool.toolCallId] || tool.toolName;
 
-      if (tool.toolName === 'hf_jobs' && args?.script) {
-        const jobOutput = tool.output ?? (tool.state === 'output-error' ? (tool as Record<string, unknown>).errorText : undefined);
-        const hasOutput = (tool.state === 'output-available' || tool.state === 'output-error') && jobOutput;
-        const scriptContent = getEditedScript(tool.toolCallId) || String(args.script);
-        setPanel(
-          {
-            title: displayName,
-            script: { content: scriptContent, language: 'python' },
-            ...(hasOutput ? { output: { content: String(jobOutput), language: 'markdown' } } : {}),
-            parameters: { tool_call_id: tool.toolCallId },
-          },
-          hasOutput ? 'output' : 'script',
-        );
-        setRightPanelOpen(true);
-        setLeftSidebarOpen(false);
-        return;
-      }
-
       const inputSection = args ? { content: JSON.stringify(args, null, 2), language: 'json' } : undefined;
 
       const outputText = tool.output ?? (tool.state === 'output-error' ? (tool as Record<string, unknown>).errorText : undefined);
@@ -746,7 +625,7 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
         setRightPanelOpen(true);
       }
     },
-    [toolDisplayMap, setPanel, getEditedScript, setRightPanelOpen, setLeftSidebarOpen],
+    [toolDisplayMap, setPanel, setRightPanelOpen],
   );
 
   // ── Panel click handler ───────────────────────────────────────────
@@ -793,17 +672,6 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
       }
     }
   }, [tools, lockedToolId, showToolPanel]);
-
-  // ── Parse hf_jobs metadata from output ────────────────────────────
-  function parseJobMeta(output: unknown): { jobUrl?: string; jobStatus?: string } {
-    if (typeof output !== 'string') return {};
-    const urlMatch = output.match(/\*\*View at:\*\*\s*(https:\/\/[^\s\n]+)/);
-    const statusMatch = output.match(/\*\*Final Status:\*\*\s*([^\n]+)/);
-    return {
-      jobUrl: urlMatch?.[1],
-      jobStatus: statusMatch?.[1]?.trim(),
-    };
-  }
 
   // ── Render ────────────────────────────────────────────────────────
   const decidedCount = pendingTools.filter(t => decisions[t.toolCallId]).length;
@@ -902,26 +770,6 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
             : hasError ? 'error'
             : statusLabel(displayState as ToolPartState);
 
-          // Parse job metadata from hf_jobs output and store
-          const jobUrlFromStore = tool.toolName === 'hf_jobs' ? getJobUrl(tool.toolCallId) : undefined;
-          const jobStatusFromStore = tool.toolName === 'hf_jobs' ? getJobStatus(tool.toolCallId) : undefined;
-
-          const jobMetaFromOutput = tool.toolName === 'hf_jobs' && (tool.output || (tool as Record<string, unknown>).errorText)
-            ? parseJobMeta(tool.output ?? (tool as Record<string, unknown>).errorText)
-            : {};
-
-          // Store job status if we just parsed it and don't have it stored yet
-          if (tool.toolName === 'hf_jobs' && jobMetaFromOutput.jobStatus && !jobStatusFromStore) {
-            setJobStatus(tool.toolCallId, jobMetaFromOutput.jobStatus);
-          }
-
-          // Combine job URL and status from store (persisted) with output metadata (freshly parsed)
-          // Prefer stored values to ensure they persist across renders
-          const jobMeta = {
-            jobUrl: jobUrlFromStore || jobMetaFromOutput.jobUrl,
-            jobStatus: jobStatusFromStore || jobMetaFromOutput.jobStatus,
-          };
-
           return (
             <Box key={tool.toolCallId}>
               {/* Main tool row */}
@@ -946,9 +794,7 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
                   state={
                     hasError
                       ? 'output-error'
-                      : ((tool.toolName === 'hf_jobs' && jobMeta.jobStatus && ['ERROR', 'FAILED', 'CANCELLED'].includes(jobMeta.jobStatus))
-                        ? 'output-error'
-                        : displayState as ToolPartState)
+                      : displayState as ToolPartState
                   }
                 />
 
@@ -969,7 +815,7 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
                   {toolDisplayMap[tool.toolCallId] || tool.toolName}
                 </Typography>
 
-                {/* Status chip (non hf_jobs, or hf_jobs without final status) */}
+                {/* Status chip */}
                 {(() => {
                   // Research tool: override chip label with this card's agent stats
                   const agentState: ResearchAgentState | undefined = tool.toolName === 'research'
@@ -983,7 +829,7 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
                         : researchChipLabel(agentState.stats, liveElapsed))
                     : null;
                   const chipLabel = researchLabel || label;
-                  if (!chipLabel || (tool.toolName === 'hf_jobs' && jobMeta.jobStatus)) return null;
+                  if (!chipLabel) return null;
 
                   return (
                     <Chip
@@ -1006,53 +852,6 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
                   );
                 })()}
 
-                {/* HF Jobs: final status chip from job metadata */}
-                {tool.toolName === 'hf_jobs' && jobMeta.jobStatus && (
-                  <Chip
-                    label={jobMeta.jobStatus}
-                    size="small"
-                    sx={{
-                      height: 20,
-                      fontSize: '0.65rem',
-                      fontWeight: 600,
-                      bgcolor: jobMeta.jobStatus === 'COMPLETED'
-                        ? 'rgba(47,204,113,0.12)'
-                        : ['ERROR', 'FAILED', 'CANCELLED'].includes(jobMeta.jobStatus!)
-                          ? 'rgba(224,90,79,0.12)'
-                          : 'rgba(255,193,59,0.12)',
-                      color: jobMeta.jobStatus === 'COMPLETED'
-                        ? 'var(--accent-green)'
-                        : ['ERROR', 'FAILED', 'CANCELLED'].includes(jobMeta.jobStatus!)
-                          ? 'var(--accent-red)'
-                          : 'var(--accent-yellow)',
-                      letterSpacing: '0.03em',
-                    }}
-                  />
-                )}
-
-                {/* View on HF link — single place, shown whenever URL is available */}
-                {tool.toolName === 'hf_jobs' && jobMeta.jobUrl && (
-                  <Link
-                    href={jobMeta.jobUrl}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    onClick={(e) => e.stopPropagation()}
-                    sx={{
-                      display: 'inline-flex',
-                      alignItems: 'center',
-                      gap: 0.5,
-                      color: 'var(--accent-yellow)',
-                      fontSize: '0.68rem',
-                      textDecoration: 'none',
-                      ml: 0.5,
-                      '&:hover': { textDecoration: 'underline' },
-                    }}
-                  >
-                    <LaunchIcon sx={{ fontSize: 12 }} />
-                    View on HF
-                  </Link>
-                )}
-
                 {clickable && !isPending && (
                   <OpenInNewIcon sx={{ fontSize: 14, color: 'var(--muted-text)', opacity: 0.6 }} />
                 )}
@@ -1069,7 +868,6 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
                   toolCallId={tool.toolCallId}
                   toolName={tool.toolName}
                   input={tool.input}
-                  scriptLabel={scriptLabelMap[tool.toolCallId] || 'Script'}
                   onResolve={handleIndividualDecision}
                 />
               )}

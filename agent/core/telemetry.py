@@ -1,13 +1,12 @@
 """All agent observability in one module.
 
-Every telemetry signal the agent emits — LLM-call usage / cost, hf_jobs
-lifecycle, sandbox lifecycle, user feedback, mid-turn heartbeat saves — is
+Every telemetry signal the agent emits - LLM-call usage / cost,
+sandbox lifecycle, user feedback, mid-turn heartbeat saves - is
 defined here so business-logic files stay free of instrumentation noise.
 
 Callsites are one-liners::
 
     await telemetry.record_llm_call(session, model=..., response=r, ...)
-    await telemetry.record_hf_job_submit(session, job, args, image=..., job_type="Python")
     HeartbeatSaver.maybe_fire(session)
 
 All ``record_*`` functions emit a single ``Event`` via ``session.send_event``
@@ -98,73 +97,6 @@ async def record_llm_call(
     except Exception as e:
         logger.debug("record_llm_call failed (non-fatal): %s", e)
     return usage
-
-
-# ── hf_jobs ────────────────────────────────────────────────────────────────
-
-def _infer_push_to_hub(script_or_cmd: Any) -> bool:
-    if not isinstance(script_or_cmd, str):
-        return False
-    return (
-        "push_to_hub=True" in script_or_cmd
-        or "push_to_hub=true" in script_or_cmd
-        or "hub_model_id" in script_or_cmd
-    )
-
-
-async def record_hf_job_submit(
-    session: Any,
-    job: Any,
-    args: dict,
-    *,
-    image: str,
-    job_type: str,
-) -> float:
-    """Emit ``hf_job_submit``. Returns the monotonic start timestamp so the
-    caller can pass it back into :func:`record_hf_job_complete`."""
-    from agent.core.session import Event
-    t_start = time.monotonic()
-    try:
-        script_text = args.get("script") or args.get("command") or ""
-        await session.send_event(Event(
-            event_type="hf_job_submit",
-            data={
-                "job_id": getattr(job, "id", None),
-                "job_url": getattr(job, "url", None),
-                "flavor": args.get("hardware_flavor", "cpu-basic"),
-                "timeout": args.get("timeout", "30m"),
-                "job_type": job_type,
-                "image": image,
-                "push_to_hub": _infer_push_to_hub(script_text),
-            },
-        ))
-    except Exception as e:
-        logger.debug("record_hf_job_submit failed (non-fatal): %s", e)
-    return t_start
-
-
-async def record_hf_job_complete(
-    session: Any,
-    job: Any,
-    *,
-    flavor: str,
-    final_status: str,
-    submit_ts: float,
-) -> None:
-    from agent.core.session import Event
-    try:
-        wall_time_s = int(time.monotonic() - submit_ts)
-        await session.send_event(Event(
-            event_type="hf_job_complete",
-            data={
-                "job_id": getattr(job, "id", None),
-                "flavor": flavor,
-                "final_status": final_status,
-                "wall_time_s": wall_time_s,
-            },
-        ))
-    except Exception as e:
-        logger.debug("record_hf_job_complete failed (non-fatal): %s", e)
 
 
 # ── sandbox ─────────────────────────────────────────────────────────────────

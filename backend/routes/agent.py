@@ -191,7 +191,7 @@ async def create_session(
     """Create a new agent session bound to the authenticated user.
 
     The user's HF access token is extracted from the Authorization header
-    and stored in the session so that tools (e.g. hf_jobs) can act on
+    and stored in the session so that tools can act on
     behalf of the user.
 
     Optional body fields can provide a model and OpenAI-compatible provider

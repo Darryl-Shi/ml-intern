@@ -18,14 +18,10 @@ from agent.tools.github_read_file import (
     GITHUB_READ_FILE_TOOL_SPEC,
     github_read_file_handler,
 )
-from agent.tools.jobs_tool import HF_JOBS_TOOL_SPEC, HfJobsTool, hf_jobs_handler
 from agent.tools.types import ToolResult
 
 __all__ = [
     "ToolResult",
-    "HF_JOBS_TOOL_SPEC",
-    "hf_jobs_handler",
-    "HfJobsTool",
     "GITHUB_FIND_EXAMPLES_TOOL_SPEC",
     "github_find_examples_handler",
     "GITHUB_LIST_REPOS_TOOL_SPEC",

@@ -7,7 +7,7 @@
  *  - Panel state (right panel — single-artifact pattern)
  *  - Plan state
  *  - User info / error banners
- *  - Edited scripts (for hf_jobs code editing)
+ *  - Edited scripts
  *
  * Per-session state:
  *  Each session maintains its own snapshot of processing/activity/panel/plan
@@ -120,12 +120,6 @@ interface AgentStore {
   // Edited scripts (tool_call_id -> edited content)
   editedScripts: Record<string, string>;
 
-  // Job URLs (tool_call_id -> job URL) for HF jobs
-  jobUrls: Record<string, string>;
-
-  // Job statuses (tool_call_id -> job status) for HF jobs
-  jobStatuses: Record<string, string>;
-
   // Tool error states (tool_call_id -> true if errored) - persisted across renders
   toolErrors: Record<string, boolean>;
 
@@ -166,12 +160,6 @@ interface AgentStore {
   setEditedScript: (toolCallId: string, content: string) => void;
   getEditedScript: (toolCallId: string) => string | undefined;
   clearEditedScripts: () => void;
-
-  setJobUrl: (toolCallId: string, jobUrl: string) => void;
-  getJobUrl: (toolCallId: string) => string | undefined;
-
-  setJobStatus: (toolCallId: string, status: string) => void;
-  getJobStatus: (toolCallId: string) => string | undefined;
 
   setToolError: (toolCallId: string, hasError: boolean) => void;
   getToolError: (toolCallId: string) => boolean | undefined;
@@ -255,8 +243,6 @@ export const useAgentStore = create<AgentStore>()((set, get) => ({
   plan: [],
 
   editedScripts: {},
-  jobUrls: {},
-  jobStatuses: {},
   toolErrors: loadToolErrors(),
   rejectedTools: loadRejectedTools(),
 
@@ -422,26 +408,6 @@ export const useAgentStore = create<AgentStore>()((set, get) => ({
   getEditedScript: (toolCallId) => get().editedScripts[toolCallId],
 
   clearEditedScripts: () => set({ editedScripts: {} }),
-
-  // ── Job URLs ────────────────────────────────────────────────────────
-
-  setJobUrl: (toolCallId, jobUrl) => {
-    set((state) => ({
-      jobUrls: { ...state.jobUrls, [toolCallId]: jobUrl },
-    }));
-  },
-
-  getJobUrl: (toolCallId) => get().jobUrls[toolCallId],
-
-  // ── Job Statuses ────────────────────────────────────────────────────
-
-  setJobStatus: (toolCallId, status) => {
-    set((state) => ({
-      jobStatuses: { ...state.jobStatuses, [toolCallId]: status },
-    }));
-  },
-
-  getJobStatus: (toolCallId) => get().jobStatuses[toolCallId],
 
   // ── Tool Errors ─────────────────────────────────────────────────────
 

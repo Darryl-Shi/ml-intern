@@ -438,6 +438,10 @@ HELP_TEXT = f"""\
 {_I}[bold]Commands[/bold]
 {_I}  [cyan]/help[/cyan]            Show this help
 {_I}  [cyan]/undo[/cyan]            Undo last turn
+{_I}  [cyan]/history[/cyan]         List restore points
+{_I}  [cyan]/restore[/cyan] [turn]  Restore messages and local files
+{_I}  [cyan]/rewind[/cyan] [msg]    Rewind and edit a previous message
+{_I}  [cyan]Esc Esc[/cyan]          Open rewind chooser
 {_I}  [cyan]/compact[/cyan]         Compact context window
 {_I}  [cyan]/model[/cyan] [id]      Show available models or switch
 {_I}  [cyan]/effort[/cyan] [level]  Reasoning effort (minimal|low|medium|high|xhigh|max|off)

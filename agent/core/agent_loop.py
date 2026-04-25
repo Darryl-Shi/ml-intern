@@ -17,7 +17,6 @@ from agent.core.provider import chat_completion, require_provider_config
 from agent.core.prompt_caching import with_prompt_caching
 from agent.core.session import Event, OpType, Session
 from agent.core.tools import ToolRouter
-from agent.tools.jobs_tool import CPU_FLAVORS
 
 logger = logging.getLogger(__name__)
 
@@ -61,28 +60,6 @@ def _needs_approval(
         return False
 
     if tool_name == "sandbox_create":
-        return True
-
-    if tool_name == "hf_jobs":
-        operation = tool_args.get("operation", "")
-        if operation not in ["run", "uv", "scheduled run", "scheduled uv"]:
-            return False
-
-        # Check if this is a CPU-only job
-        # hardware_flavor is at top level of tool_args, not nested in args
-        hardware_flavor = (
-            tool_args.get("hardware_flavor")
-            or tool_args.get("flavor")
-            or tool_args.get("hardware")
-            or "cpu-basic"
-        )
-        is_cpu_job = hardware_flavor in CPU_FLAVORS
-
-        if is_cpu_job:
-            if config and not config.confirm_cpu_jobs:
-                return False
-            return True
-
         return True
 
     # Check for file upload operations (hf_private_repos or other tools)
@@ -258,7 +235,7 @@ async def _compact_and_notify(session: Session) -> None:
 
 
 async def _cleanup_on_cancel(session: Session) -> None:
-    """Kill sandbox processes and cancel HF jobs when the user interrupts."""
+    """Kill sandbox processes when the user interrupts."""
     # Kill active sandbox processes
     sandbox = getattr(session, "sandbox", None)
     if sandbox:
@@ -267,20 +244,6 @@ async def _cleanup_on_cancel(session: Session) -> None:
             logger.info("Killed sandbox processes on cancel")
         except Exception as e:
             logger.warning("Failed to kill sandbox processes: %s", e)
-
-    # Cancel running HF jobs
-    job_ids = list(session._running_job_ids)
-    if job_ids:
-        from huggingface_hub import HfApi
-
-        api = HfApi(token=session.hf_token)
-        for job_id in job_ids:
-            try:
-                await asyncio.to_thread(api.cancel_job, job_id=job_id)
-                logger.info("Cancelled HF job %s on interrupt", job_id)
-            except Exception as e:
-                logger.warning("Failed to cancel HF job %s: %s", job_id, e)
-        session._running_job_ids.clear()
 
 
 @dataclass
@@ -884,15 +847,6 @@ class Handlers:
                     # Prepare batch approval data
                     tools_data = []
                     for tc, tool_name, tool_args in approval_required_tools:
-                        # Resolve sandbox file paths for hf_jobs scripts so the
-                        # frontend can display & edit the actual file content.
-                        if tool_name == "hf_jobs" and isinstance(tool_args.get("script"), str):
-                            from agent.tools.sandbox_tool import resolve_sandbox_script
-                            sandbox = getattr(session, "sandbox", None)
-                            resolved, _ = await resolve_sandbox_script(sandbox, tool_args["script"])
-                            if resolved:
-                                tool_args = {**tool_args, "script": resolved}
-
                         tools_data.append({
                             "tool": tool_name,
                             "arguments": tool_args,
@@ -953,8 +907,9 @@ class Handlers:
                 )
             )
 
-        # Increment turn counter and check for auto-save
+        # Increment turn counter, snapshot local CLI state, and check for auto-save
         session.increment_turn()
+        session.checkpoint_local_state(label=f"turn {session.turn_count}")
         await session.auto_save_if_needed()
 
         return final_response
@@ -965,6 +920,15 @@ class Handlers:
         removed = session.context_manager.undo_last_turn()
         if not removed:
             logger.warning("Undo: no user message found to remove")
+        else:
+            checkpoint = session.local_checkpoint_at_or_before_message_count(
+                len(session.context_manager.items)
+            )
+            if checkpoint is not None:
+                try:
+                    session.restore_to_local_checkpoint(checkpoint)
+                except Exception as e:
+                    logger.warning("Undo: failed to restore local checkpoint: %s", e)
         await session.send_event(Event(event_type="undo_complete"))
 
     @staticmethod
@@ -1124,6 +1088,7 @@ class Handlers:
                 await _cleanup_on_cancel(session)
                 await session.send_event(Event(event_type="interrupted"))
                 session.increment_turn()
+                session.checkpoint_local_state(label=f"turn {session.turn_count}")
                 await session.auto_save_if_needed()
                 return
 

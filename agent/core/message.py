@@ -85,6 +85,15 @@ def normalize_tool_call(raw: ToolCall | dict[str, Any] | Any) -> ToolCall:
     )
 
 
+def message_from_mapping(raw: dict[str, Any]) -> Message:
+    """Load a persisted message while ignoring provider-specific extras."""
+    allowed = {"role", "content", "tool_calls", "tool_call_id", "name"}
+    data = {key: raw[key] for key in allowed if key in raw}
+    if "role" not in data:
+        raise ValueError("Persisted message is missing role")
+    return Message(**data)
+
+
 def to_openai_message(message: Message | dict[str, Any] | Any) -> dict[str, Any]:
     if isinstance(message, dict):
         data = dict(message)

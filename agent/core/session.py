@@ -12,6 +12,7 @@ from typing import Any, Optional
 
 from agent.config import Config
 from agent.context_manager.manager import ContextManager
+from agent.core.local_checkpoint import LocalSnapshotManager
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +78,6 @@ class Session:
         self._cancelled = asyncio.Event()
         self.pending_approval: Optional[dict[str, Any]] = None
         self.sandbox = None
-        self._running_job_ids: set[str] = set()  # HF job IDs currently executing
 
         # Session trajectory logging
         self.logged_events: list[dict] = []
@@ -89,6 +89,10 @@ class Session:
         # ``agent.core.telemetry.HeartbeatSaver`` and lazily initialised there.
         self._local_save_path: Optional[str] = None
         self._last_heartbeat_ts: Optional[float] = None
+        self.local_snapshot_manager: LocalSnapshotManager | None = None
+        self.local_state_root: str | None = None
+        self.local_checkpoints: list[dict[str, Any]] = []
+        self.restored_from: str | None = None
 
         # Per-model reasoning-effort cache. Populated when a provider rejects
         # reasoning fields, read by ``effective_effort_for`` below. Keys are
@@ -152,6 +156,79 @@ class Session:
         """Increment turn counter (called after each user interaction)"""
         self.turn_count += 1
 
+    def attach_local_snapshots(
+        self,
+        root: str | Path,
+        checkpoints: list[dict[str, Any]] | None = None,
+    ) -> None:
+        """Enable working-directory checkpoints for this CLI session."""
+        resolved_root = Path(root).resolve()
+        self.local_snapshot_manager = LocalSnapshotManager(
+            resolved_root,
+            self.session_id,
+            base_dir=resolved_root / "session_logs" / "snapshots",
+        )
+        self.local_state_root = str(resolved_root)
+        self.local_checkpoints = list(checkpoints or [])
+
+    def checkpoint_local_state(self, label: str | None = None) -> dict[str, Any] | None:
+        """Snapshot the working directory if CLI local snapshots are enabled."""
+        if self.local_snapshot_manager is None:
+            return None
+
+        message_count = len(self.context_manager.items)
+        if (
+            self.local_checkpoints
+            and self.local_checkpoints[-1].get("message_count") == message_count
+        ):
+            return self.local_checkpoints[-1]
+
+        checkpoint = self.local_snapshot_manager.create(
+            label=label or f"turn {self.turn_count}",
+            message_count=message_count,
+            turn_count=self.turn_count,
+        )
+        self.local_checkpoints.append(checkpoint)
+        return checkpoint
+
+    def local_checkpoint_for_turn(self, turn_count: int) -> dict[str, Any] | None:
+        """Return the newest checkpoint for ``turn_count``."""
+        matches = [
+            checkpoint
+            for checkpoint in self.local_checkpoints
+            if int(checkpoint.get("turn_count", -1)) == turn_count
+        ]
+        return matches[-1] if matches else None
+
+    def latest_local_checkpoint(self) -> dict[str, Any] | None:
+        return self.local_checkpoints[-1] if self.local_checkpoints else None
+
+    def local_checkpoint_at_or_before_message_count(
+        self, message_count: int
+    ) -> dict[str, Any] | None:
+        """Return the newest checkpoint whose context length fits the history."""
+        matches = [
+            checkpoint
+            for checkpoint in self.local_checkpoints
+            if int(checkpoint.get("message_count", 0)) <= message_count
+        ]
+        return matches[-1] if matches else None
+
+    def restore_to_local_checkpoint(self, checkpoint: dict[str, Any]) -> None:
+        """Restore files and truncate chat history to a checkpoint boundary."""
+        if self.local_snapshot_manager is None:
+            root = checkpoint.get("root") or self.local_state_root or "."
+            self.attach_local_snapshots(root, self.local_checkpoints)
+        assert self.local_snapshot_manager is not None
+        self.local_snapshot_manager.restore(checkpoint)
+
+        message_count = int(
+            checkpoint.get("message_count", len(self.context_manager.items))
+        )
+        self.context_manager.items = self.context_manager.items[:message_count]
+        self.turn_count = int(checkpoint.get("turn_count", self.turn_count))
+        self.restored_from = checkpoint.get("checkpoint_id")
+
     async def auto_save_if_needed(self) -> None:
         """Check if auto-save should trigger and save if so (completely non-blocking)"""
         if not self.config.save_sessions:
@@ -176,7 +253,7 @@ class Session:
                 tools = self.tool_router.get_tool_specs_for_llm() or []
             except Exception:
                 tools = []
-        return {
+        trajectory = {
             "session_id": self.session_id,
             "session_start_time": self.session_start_time,
             "session_end_time": datetime.now().isoformat(),
@@ -185,6 +262,13 @@ class Session:
             "events": self.logged_events,
             "tools": tools,
         }
+        if self.local_state_root is not None:
+            trajectory["local_state"] = {
+                "root": self.local_state_root,
+                "checkpoints": self.local_checkpoints,
+                "restored_from": self.restored_from,
+            }
+        return trajectory
 
     def save_trajectory_local(
         self,
