@@ -21,7 +21,7 @@ from copy import deepcopy
 from functools import lru_cache
 from typing import Any
 
-from agent.core.session import Event
+from agent.mcp_types import Event, ToolSpec
 from agent.tools.sandbox_client import Sandbox
 
 
@@ -139,11 +139,17 @@ async def _ensure_sandbox(
         watcher_task.cancel()
     session.sandbox = sb
 
-    # Telemetry: sandbox creation (infra consumption signal)
-    from agent.core import telemetry
-    await telemetry.record_sandbox_create(
-        session, sb, hardware=hardware,
-        create_latency_s=int(_t.monotonic() - _t_start),
+    create_latency_s = int(_t.monotonic() - _t_start)
+    session._sandbox_created_at = _t.monotonic() - create_latency_s
+    await session.send_event(
+        Event(
+            event_type="sandbox_create",
+            data={
+                "sandbox_id": getattr(sb, "space_id", None),
+                "hardware": hardware,
+                "create_latency_s": create_latency_s,
+            },
+        )
     )
 
     await session.send_event(
@@ -335,8 +341,6 @@ def _make_tool_handler(sandbox_tool_name: str):
 
 def get_sandbox_tools():
     """Return all 5 sandbox ToolSpecs (sandbox_create + 4 operation tools)."""
-    from agent.core.tools import ToolSpec
-
     tools = []
 
     # sandbox_create (explicit creation, requires approval)
