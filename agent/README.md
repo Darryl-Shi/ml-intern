@@ -1,6 +1,6 @@
 # Agent
 
-Async agent loop with LiteLLM.
+Async agent loop with OpenAI-compatible chat-completions providers.
 
 ## Architecture
 
@@ -13,7 +13,7 @@ Async agent loop with LiteLLM.
 
 | Component | Purpose | Long Term Goal |
 |-----------|---------|----------------|
-| **`agent_loop.py`** | Core agentic loop: processes user input, calls LLM via LiteLLM, executes tool calls iteratively until completion, emits events | Support parallel tool execution, streaming responses, and advanced reasoning patterns |
+| **`agent_loop.py`** | Core agentic loop: processes user input, calls the configured OpenAI-compatible provider, executes tool calls iteratively until completion, emits events | Support parallel tool execution, streaming responses, and advanced reasoning patterns |
 | **`session.py`** | Maintains session state and interaction with potential UI (context, config, event queue), handles interrupts, assigns unique session IDs for tracing | Enable plugging in different UIs (CLI, web, API, programmatic etc.) |
 | **`tools.py`** | `ToolRouter` manages potential built-in tools (e.g. bash, read_file, write_file which are dummy implementations rn) + MCP tools, converts specs to OpenAI format | Be the place for tools that can be used by the agent. All crazy tool design happens here. |
 | **`context_manager/`** | Manages conversation history, very rudimentary context engineering support | Implement intelligent context engineering to keep the agent on track |

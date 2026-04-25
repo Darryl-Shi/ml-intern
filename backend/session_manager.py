@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from agent.config import load_config
+from agent.core.provider import ProviderConfig, apply_provider_to_config, resolve_provider_config
 from agent.core.agent_loop import process_submission
 from agent.core.session import Event, OpType, Session
 from agent.core.tools import ToolRouter
@@ -91,10 +92,6 @@ class AgentSession:
     is_active: bool = True
     is_processing: bool = False  # True while a submission is being executed
     broadcaster: Any = None
-    # True once this session has been counted against the user's daily
-    # Claude quota. Guards double-counting when the user re-selects an
-    # Anthropic model mid-session.
-    claude_counted: bool = False
 
 
 class SessionCapacityError(Exception):
@@ -135,12 +132,13 @@ class SessionManager:
         user_id: str = "dev",
         hf_token: str | None = None,
         model: str | None = None,
+        provider: ProviderConfig | None = None,
     ) -> str:
         """Create a new agent session and return its ID.
 
-        Session() and ToolRouter() constructors contain blocking I/O
-        (e.g. HfApi().whoami(), litellm.get_max_tokens()) so they are
-        executed in a thread pool to avoid freezing the async event loop.
+        Session() and ToolRouter() constructors can touch local config and
+        provider/tool metadata, so they run in a thread pool to avoid
+        freezing the async event loop.
 
         Args:
             user_id: The ID of the user who owns this session.
@@ -178,16 +176,17 @@ class SessionManager:
         event_queue: asyncio.Queue = asyncio.Queue()
 
         # Run blocking constructors in a thread to keep the event loop responsive.
-        # Without this, Session.__init__ → ContextManager → litellm.get_max_tokens()
-        # blocks all HTTP/SSE handling.
         import time as _time
 
         def _create_session_sync():
             t0 = _time.monotonic()
             tool_router = ToolRouter(self.config.mcpServers, hf_token=hf_token)
-            # Deep-copy config so each session's model switches independently —
-            # tab A picking GLM doesn't flip tab B off Claude.
+            # Deep-copy config so each session's model/provider switches
+            # independently across browser tabs.
             session_config = self.config.model_copy(deep=True)
+            provider_config = provider or resolve_provider_config(session_config)
+            if provider_config:
+                apply_provider_to_config(session_config, provider_config)
             if model:
                 session_config.model_name = model
             session = Session(
@@ -230,8 +229,7 @@ class SessionManager:
         with that summary. Tool-call pairing concerns disappear because the
         output is plain text. Returns the number of messages summarized.
         """
-        from litellm import Message
-
+        from agent.core.message import Message
         from agent.context_manager.manager import _RESTORE_PROMPT, summarize_messages
 
         agent_session = self.sessions.get(session_id)
@@ -244,7 +242,7 @@ class SessionManager:
             if raw.get("role") == "system":
                 continue  # the new session has its own system prompt
             try:
-                parsed.append(Message.model_validate(raw))
+                parsed.append(Message(**raw))
             except Exception as e:
                 logger.warning("Dropping malformed message during seed: %s", e)
 
@@ -253,9 +251,7 @@ class SessionManager:
 
         session = agent_session.session
         # Pass the real tool specs so the summarizer sees what the agent
-        # actually has — otherwise Anthropic's modify_params injects a
-        # dummy tool and the summarizer editorializes that the original
-        # tool calls were fabricated.
+        # actually has.
         tool_specs = None
         try:
             tool_specs = agent_session.tool_router.get_tool_specs_for_llm()
@@ -269,6 +265,7 @@ class SessionManager:
                 max_tokens=4000,
                 prompt=_RESTORE_PROMPT,
                 tool_specs=tool_specs,
+                provider_config=resolve_provider_config(session.config),
             )
         except Exception as e:
             logger.error("Summary call failed during seed: %s", e)
@@ -518,6 +515,11 @@ class SessionManager:
             "user_id": agent_session.user_id,
             "pending_approval": pending_approval,
             "model": agent_session.session.config.model_name,
+            "provider": (
+                resolve_provider_config(agent_session.session.config).redacted()
+                if resolve_provider_config(agent_session.session.config)
+                else None
+            ),
         }
 
     def list_sessions(self, user_id: str | None = None) -> list[dict[str, Any]]:

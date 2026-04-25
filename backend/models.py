@@ -54,6 +54,13 @@ class SubmitRequest(BaseModel):
     text: str
 
 
+class ProviderConfigInfo(BaseModel):
+    model: str
+    base_url: str
+    api_key_set: bool = True
+    context_window: int
+
+
 class TruncateRequest(BaseModel):
     """Request to truncate conversation history to before a specific user message."""
 
@@ -86,6 +93,7 @@ class SessionInfo(BaseModel):
     user_id: str = "dev"
     pending_approval: list[PendingApprovalTool] | None = None
     model: str | None = None
+    provider: ProviderConfigInfo | None = None
 
 
 class HealthResponse(BaseModel):

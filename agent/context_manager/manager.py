@@ -11,8 +11,8 @@ from typing import Any
 
 import yaml
 from jinja2 import Template
-from litellm import Message, acompletion
-
+from agent.core.message import Message, rough_token_count
+from agent.core.provider import ProviderConfig, chat_completion, require_provider_config
 from agent.core.prompt_caching import with_prompt_caching
 
 logger = logging.getLogger(__name__)
@@ -102,6 +102,7 @@ async def summarize_messages(
     max_tokens: int = 2000,
     tool_specs: list[dict] | None = None,
     prompt: str = _COMPACT_PROMPT,
+    provider_config: ProviderConfig | None = None,
 ) -> tuple[str, int]:
     """Run a summarization prompt against a list of messages.
 
@@ -112,18 +113,16 @@ async def summarize_messages(
 
     Returns ``(summary_text, completion_tokens)``.
     """
-    from agent.core.llm_params import _resolve_llm_params
-
     prompt_messages = list(messages) + [Message(role="user", content=prompt)]
-    llm_params = _resolve_llm_params(model_name, hf_token, reasoning_effort="high")
+    provider = provider_config or require_provider_config()
     prompt_messages, tool_specs = with_prompt_caching(
-        prompt_messages, tool_specs, llm_params.get("model")
+        prompt_messages, tool_specs, provider.model
     )
-    response = await acompletion(
+    response = await chat_completion(
+        provider=provider,
         messages=prompt_messages,
-        max_completion_tokens=max_tokens,
+        max_tokens=max_tokens,
         tools=tool_specs,
-        **llm_params,
     )
     summary = response.choices[0].message.content or ""
     completion_tokens = response.usage.completion_tokens if response.usage else 0
@@ -149,9 +148,8 @@ class ContextManager:
             hf_token=hf_token,
             local_mode=local_mode,
         )
-        # The model's real input-token ceiling (from litellm.get_model_info).
-        # Compaction triggers at _COMPACT_THRESHOLD_RATIO below it — see
-        # the compaction_threshold property.
+        # The configured/provider input-token ceiling. Compaction triggers at
+        # _COMPACT_THRESHOLD_RATIO below it.
         self.model_max_tokens = model_max_tokens
         self.compact_size = int(model_max_tokens * compact_size)
         # Running count of tokens the last LLM call reported. Drives the
@@ -232,23 +230,15 @@ class ContextManager:
 
     @staticmethod
     def _normalize_tool_calls(msg: Message) -> None:
-        """Ensure msg.tool_calls contains proper ToolCall objects, not dicts.
-
-        litellm's Message has validate_assignment=False (Pydantic v2 default),
-        so direct attribute assignment (e.g. inside litellm's streaming handler)
-        can leave raw dicts.  Re-assigning via the constructor fixes this.
-        """
-        from litellm import ChatCompletionMessageToolCall as ToolCall
-
+        """Ensure msg.tool_calls contains proper ToolCall objects, not dicts."""
+        from agent.core.message import normalize_tool_call
         tool_calls = getattr(msg, "tool_calls", None)
         if not tool_calls:
             return
         needs_fix = any(isinstance(tc, dict) for tc in tool_calls)
         if not needs_fix:
             return
-        msg.tool_calls = [
-            tc if not isinstance(tc, dict) else ToolCall(**tc) for tc in tool_calls
-        ]
+        msg.tool_calls = [normalize_tool_call(tc) for tc in tool_calls]
 
     def _patch_dangling_tool_calls(self) -> None:
         """Add stub tool results for any tool_calls that lack a matching result.
@@ -348,6 +338,7 @@ class ContextManager:
         model_name: str,
         tool_specs: list[dict] | None = None,
         hf_token: str | None = None,
+        provider_config: ProviderConfig | None = None,
     ) -> None:
         """Remove old messages to keep history under target size"""
         if not self.needs_compaction:
@@ -387,6 +378,7 @@ class ContextManager:
             max_tokens=self.compact_size,
             tool_specs=tool_specs,
             prompt=_COMPACT_PROMPT,
+            provider_config=provider_config,
         )
         summarized_message = Message(role="assistant", content=summary)
 
@@ -396,16 +388,4 @@ class ContextManager:
             head.append(first_user_msg)
         self.items = head + [summarized_message] + recent_messages
 
-        # Count the actual post-compact context — system prompt + first user
-        # turn + summary + the preserved tail all contribute, not just the
-        # summary. litellm.token_counter uses the model's real tokenizer.
-        from litellm import token_counter
-
-        try:
-            self.running_context_usage = token_counter(
-                model=model_name,
-                messages=[m.model_dump() for m in self.items],
-            )
-        except Exception as e:
-            logger.warning("token_counter failed post-compact (%s); falling back to rough estimate", e)
-            self.running_context_usage = len(self.system_prompt) // 4 + completion_tokens
+        self.running_context_usage = rough_token_count(self.items) + completion_tokens

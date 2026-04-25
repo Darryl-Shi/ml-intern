@@ -14,6 +14,7 @@ import RocketLaunchIcon from '@mui/icons-material/RocketLaunch';
 import { useSessionStore } from '@/store/sessionStore';
 import { useAgentStore } from '@/store/agentStore';
 import { apiFetch } from '@/utils/api';
+import { providerRequestBody } from '@/utils/provider';
 import { isInIframe, triggerLogin } from '@/hooks/useAuth';
 import { useOrgMembership } from '@/hooks/useOrgMembership';
 
@@ -240,7 +241,10 @@ export default function WelcomeScreen() {
     setError(null);
 
     try {
-      const response = await apiFetch('/api/session', { method: 'POST' });
+      const response = await apiFetch('/api/session', {
+        method: 'POST',
+        body: providerRequestBody(),
+      });
       if (response.status === 503) {
         const data = await response.json();
         setError(data.detail || 'Server is at capacity. Please try again later.');

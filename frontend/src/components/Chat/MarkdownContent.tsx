@@ -111,7 +111,7 @@ const markdownSx: SxProps<Theme> = {
 /**
  * Throttled content for streaming: render the full markdown through
  * ReactMarkdown but only re-parse every ~80ms to avoid layout thrashing.
- * This is the Claude approach — always render as markdown, never split
+ * Always render as markdown; do not split code fences into separate blocks.
  * into raw text. The parser handles incomplete tables gracefully.
  */
 function useThrottledValue(value: string, isStreaming: boolean, intervalMs = 80): string {

@@ -4,17 +4,16 @@ research task and returns a summary. The subagent gets its own
 independent context (not the main conversation), so research
 work doesn't pollute the main agent's context window.
 
-Inspired by claude-code's code-explorer agent pattern.
+Inspired by the code-explorer agent pattern.
 """
 
 import json
 import logging
 from typing import Any
 
-from litellm import Message, acompletion
-
 from agent.core.doom_loop import check_for_doom_loop
-from agent.core.llm_params import _resolve_llm_params
+from agent.core.message import Message
+from agent.core.provider import chat_completion, require_provider_config
 from agent.core.prompt_caching import with_prompt_caching
 from agent.core.session import Event
 
@@ -215,10 +214,7 @@ RESEARCH_TOOL_SPEC = {
 
 
 def _get_research_model(main_model: str) -> str:
-    """Pick a cheaper model for research based on the main model."""
-    if "anthropic" in main_model:
-        return "bedrock/us.anthropic.claude-sonnet-4-6"
-    # For non-Anthropic models (HF router etc.), use the same model
+    """Use the configured provider model for research."""
     return main_model
 
 
@@ -247,17 +243,13 @@ async def research_handler(
     # Use a cheaper/faster model for research
     main_model = session.config.model_name
     research_model = _get_research_model(main_model)
-    # Research is a cheap sub-call — cap the main session's effort at "high"
-    # so a user preference of ``max``/``xhigh`` (valid for Opus 4.6/4.7) doesn't
-    # propagate to a Sonnet research model that may not accept those levels.
-    # We also haven't probed this sub-model so we don't know its ceiling.
+    # Research is a cheap sub-call; cap the main session's effort at "high"
+    # so aggressive preferences do not leak into a sub-model that may reject
+    # them.
     _pref = getattr(session.config, "reasoning_effort", None)
     _capped = "high" if _pref in ("max", "xhigh") else _pref
-    llm_params = _resolve_llm_params(
-        research_model,
-        getattr(session, "hf_token", None),
-        reasoning_effort=_capped,
-    )
+    provider = require_provider_config(session.config)
+    provider.model = research_model
 
     # Get read-only tool specs from the session's tool router
     tool_specs = [
@@ -324,13 +316,14 @@ async def research_handler(
                 ),
             ))
             try:
-                _msgs, _ = with_prompt_caching(messages, None, llm_params.get("model"))
-                response = await acompletion(
+                _msgs, _ = with_prompt_caching(messages, None, provider.model)
+                response = await chat_completion(
+                    provider=provider,
                     messages=_msgs,
                     tools=None,  # no tools — force text response
                     stream=False,
                     timeout=120,
-                    **llm_params,
+                    reasoning_effort=_capped,
                 )
                 content = response.choices[0].message.content or ""
                 return content or "Research context exhausted — no summary produced.", bool(content)
@@ -351,15 +344,16 @@ async def research_handler(
 
         try:
             _msgs, _tools = with_prompt_caching(
-                messages, tool_specs if tool_specs else None, llm_params.get("model")
+                messages, tool_specs if tool_specs else None, provider.model
             )
-            response = await acompletion(
+            response = await chat_completion(
+                provider=provider,
                 messages=_msgs,
                 tools=_tools,
                 tool_choice="auto",
                 stream=False,
                 timeout=120,
-                **llm_params,
+                reasoning_effort=_capped,
             )
         except Exception as e:
             logger.error("Research sub-agent LLM error: %s", e)
@@ -380,10 +374,8 @@ async def research_handler(
             return content, True
 
         # Execute tool calls and add results.
-        # Rebuild the assistant message with only the wire-safe fields —
-        # LiteLLM's raw Message carries `provider_specific_fields` and
-        # `reasoning_content`, which the HF router's OpenAI schema rejects
-        # if we echo them back in the next request.
+        # Rebuild the assistant message with only wire-safe fields before
+        # echoing it back in the next OpenAI-compatible request.
         messages.append(Message(
             role="assistant",
             content=msg.content,
@@ -448,13 +440,14 @@ async def research_handler(
         ),
     ))
     try:
-        _msgs, _ = with_prompt_caching(messages, None, llm_params.get("model"))
-        response = await acompletion(
+        _msgs, _ = with_prompt_caching(messages, None, provider.model)
+        response = await chat_completion(
+            provider=provider,
             messages=_msgs,
             tools=None,
             stream=False,
             timeout=120,
-            **llm_params,
+            reasoning_effort=_capped,
         )
         content = response.choices[0].message.content or ""
         if content:

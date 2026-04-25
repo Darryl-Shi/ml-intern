@@ -9,13 +9,11 @@ import os
 import time
 from dataclasses import dataclass, field
 
-from litellm import ChatCompletionMessageToolCall, Message, acompletion
-from litellm.exceptions import ContextWindowExceededError
-
 from agent.config import Config
 from agent.core import telemetry
 from agent.core.doom_loop import check_for_doom_loop
-from agent.core.llm_params import _resolve_llm_params
+from agent.core.message import Message, ToolCall
+from agent.core.provider import chat_completion, require_provider_config
 from agent.core.prompt_caching import with_prompt_caching
 from agent.core.session import Event, OpType, Session
 from agent.core.tools import ToolRouter
@@ -23,7 +21,8 @@ from agent.tools.jobs_tool import CPU_FLAVORS
 
 logger = logging.getLogger(__name__)
 
-ToolCall = ChatCompletionMessageToolCall
+class ContextWindowExceededError(Exception):
+    pass
 
 
 def _validate_tool_args(tool_args: dict) -> tuple[bool, str | None]:
@@ -140,15 +139,24 @@ def _is_transient_error(error: Exception) -> bool:
 
 
 def _is_effort_config_error(error: Exception) -> bool:
-    """Catch the two 400s the effort probe also handles — thinking
-    unsupported for this model, or the specific effort level invalid.
+    """Catch provider errors for unsupported/invalid reasoning effort."""
+    err = str(error).lower()
+    return "reasoning" in err or "effort" in err
 
-    This is our safety net for the case where ``/effort`` was changed
-    mid-conversation (which clears the probe cache) and the new level
-    doesn't work for the current model. We heal the cache and retry once.
-    """
-    from agent.core.effort_probe import _is_invalid_effort, _is_thinking_unsupported
-    return _is_thinking_unsupported(error) or _is_invalid_effort(error)
+
+def _is_context_window_error(error: Exception) -> bool:
+    err = str(error).lower()
+    patterns = (
+        "context length",
+        "context_length",
+        "context window",
+        "maximum context",
+        "max context",
+        "token limit",
+        "too many tokens",
+        "prompt is too long",
+    )
+    return any(pattern in err for pattern in patterns)
 
 
 def _has_tool_result(messages) -> bool:
@@ -177,37 +185,13 @@ async def _heal_effort_and_rebuild_params(
     llm_params. Called only when ``_is_effort_config_error(error)`` is True.
 
     Two branches:
-      • thinking-unsupported → cache ``None`` for this model, next call
-        strips thinking entirely
-      • invalid-effort → re-run the full cascade probe; the result lands
-        in the cache
+      • unsupported reasoning → cache ``None`` for this model, next call
+        strips the field entirely
     """
-    from agent.core.effort_probe import ProbeInconclusive, _is_thinking_unsupported, probe_effort
-
     model = session.config.model_name
-    if _is_thinking_unsupported(error):
-        session.model_effective_effort[model] = None
-        logger.info("healed: %s doesn't support thinking — stripped", model)
-    else:
-        try:
-            outcome = await probe_effort(
-                model, session.config.reasoning_effort, session.hf_token,
-            )
-            session.model_effective_effort[model] = outcome.effective_effort
-            logger.info(
-                "healed: %s effort cascade → %s", model, outcome.effective_effort,
-            )
-        except ProbeInconclusive:
-            # Transient during healing — strip thinking for safety, next
-            # call will either succeed or surface the real error.
-            session.model_effective_effort[model] = None
-            logger.info("healed: %s probe inconclusive — stripped", model)
-
-    return _resolve_llm_params(
-        model,
-        session.hf_token,
-        reasoning_effort=session.effective_effort_for(model),
-    )
+    session.model_effective_effort[model] = None
+    logger.info("healed: %s rejected reasoning effort — stripped", model)
+    return {"provider": require_provider_config(session.config)}
 
 
 def _friendly_error_message(error: Exception) -> str | None:
@@ -217,12 +201,8 @@ def _friendly_error_message(error: Exception) -> str | None:
     if "authentication" in err_str or "unauthorized" in err_str or "invalid x-api-key" in err_str:
         return (
             "Authentication failed — your API key is missing or invalid.\n\n"
-            "To fix this, set the API key for your model provider:\n"
-            "  • Anthropic:   export ANTHROPIC_API_KEY=sk-...\n"
-            "  • OpenAI:      export OPENAI_API_KEY=sk-...\n"
-            "  • HF Router:   export HF_TOKEN=hf_...\n\n"
-            "You can also add it to a .env file in the project root.\n"
-            "To switch models, use the /model command."
+            "Run /provider setup, or set OPENAI_BASE_URL, OPENAI_API_KEY, "
+            "and OPENAI_MODEL."
         )
 
     if "insufficient" in err_str and "credit" in err_str:
@@ -233,10 +213,8 @@ def _friendly_error_message(error: Exception) -> str | None:
 
     if "not supported by provider" in err_str or "no provider supports" in err_str:
         return (
-            "The model isn't served by the provider you pinned.\n\n"
-            "Drop the ':<provider>' suffix to let the HF router auto-pick a "
-            "provider, or use '/model' (no arg) to see which providers host "
-            "which models."
+            "The configured OpenAI-compatible provider does not serve this model. "
+            "Use /model <model-name> or /provider setup."
         )
 
     if "model_not_found" in err_str or (
@@ -244,9 +222,8 @@ def _friendly_error_message(error: Exception) -> str | None:
         and ("not found" in err_str or "does not exist" in err_str)
     ):
         return (
-            "Model not found. Use '/model' to list suggestions, or paste an "
-            "HF model id like 'MiniMaxAI/MiniMax-M2.7'. Availability is shown "
-            "when you switch."
+            "Model not found on the configured OpenAI-compatible provider. "
+            "Use /model <model-name> or /provider setup."
         )
 
     return None
@@ -264,6 +241,7 @@ async def _compact_and_notify(session: Session) -> None:
         model_name=session.config.model_name,
         tool_specs=session.tool_router.get_tool_specs_for_llm(),
         hf_token=session.hf_token,
+        provider_config=require_provider_config(session.config),
     )
     new_usage = cm.running_context_usage
     if new_usage != old_usage:
@@ -321,25 +299,28 @@ async def _call_llm_streaming(session: Session, messages, tools, llm_params) -> 
     _healed_effort = False  # one-shot safety net per call
     _dropped_tools_after_tool_result = False
     active_tools = tools
-    messages, tools = with_prompt_caching(messages, tools, llm_params.get("model"))
+    provider = llm_params["provider"]
+    messages, tools = with_prompt_caching(messages, tools, provider.model)
     t_start = time.monotonic()
     for _llm_attempt in range(_MAX_LLM_RETRIES):
         try:
             kwargs = {
+                "provider": provider,
                 "messages": messages,
                 "stream": True,
-                "stream_options": {"include_usage": True},
                 "timeout": 600,
-                **llm_params,
+                "reasoning_effort": session.effective_effort_for(session.config.model_name),
             }
             if active_tools:
                 kwargs["tools"] = active_tools
                 kwargs["tool_choice"] = "auto"
-            response = await acompletion(**kwargs)
+            response = await chat_completion(**kwargs)
             break
         except ContextWindowExceededError:
             raise
         except Exception as e:
+            if _is_context_window_error(e):
+                raise ContextWindowExceededError(str(e)) from e
             if (
                 active_tools
                 and _has_tool_result(messages)
@@ -425,7 +406,7 @@ async def _call_llm_streaming(session: Session, messages, tools, llm_params) -> 
 
     usage = await telemetry.record_llm_call(
         session,
-        model=llm_params.get("model", session.config.model_name),
+        model=provider.model,
         response=final_usage_chunk,
         latency_ms=int((time.monotonic() - t_start) * 1000),
         finish_reason=finish_reason,
@@ -446,24 +427,28 @@ async def _call_llm_non_streaming(session: Session, messages, tools, llm_params)
     _healed_effort = False
     _dropped_tools_after_tool_result = False
     active_tools = tools
-    messages, tools = with_prompt_caching(messages, tools, llm_params.get("model"))
+    provider = llm_params["provider"]
+    messages, tools = with_prompt_caching(messages, tools, provider.model)
     t_start = time.monotonic()
     for _llm_attempt in range(_MAX_LLM_RETRIES):
         try:
             kwargs = {
+                "provider": provider,
                 "messages": messages,
                 "stream": False,
                 "timeout": 600,
-                **llm_params,
+                "reasoning_effort": session.effective_effort_for(session.config.model_name),
             }
             if active_tools:
                 kwargs["tools"] = active_tools
                 kwargs["tool_choice"] = "auto"
-            response = await acompletion(**kwargs)
+            response = await chat_completion(**kwargs)
             break
         except ContextWindowExceededError:
             raise
         except Exception as e:
+            if _is_context_window_error(e):
+                raise ContextWindowExceededError(str(e)) from e
             if (
                 active_tools
                 and _has_tool_result(messages)
@@ -526,7 +511,7 @@ async def _call_llm_non_streaming(session: Session, messages, tools, llm_params)
 
     usage = await telemetry.record_llm_call(
         session,
-        model=llm_params.get("model", session.config.model_name),
+        model=provider.model,
         response=response,
         latency_ms=int((time.monotonic() - t_start) * 1000),
         finish_reason=finish_reason,
@@ -641,14 +626,10 @@ class Handlers:
             tools = session.tool_router.get_tool_specs_for_llm()
             try:
                 # ── Call the LLM (streaming or non-streaming) ──
-                # Pull the per-model probed effort from the session cache when
+                # Pull the per-model cached effort from the session cache when
                 # available; fall back to the raw preference for models we
-                # haven't probed yet (e.g. research sub-model).
-                llm_params = _resolve_llm_params(
-                    session.config.model_name,
-                    session.hf_token,
-                    reasoning_effort=session.effective_effort_for(session.config.model_name),
-                )
+                # haven't adjusted yet (e.g. research sub-model).
+                llm_params = {"provider": require_provider_config(session.config)}
                 if session.stream:
                     llm_result = await _call_llm_streaming(session, messages, tools, llm_params)
                 else:

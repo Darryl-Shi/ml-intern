@@ -1,5 +1,5 @@
 /**
- * localStorage cache of raw backend (litellm Message) dicts keyed by
+ * localStorage cache of raw backend OpenAI-compatible message dicts keyed by
  * session ID. Used to restore a session into a fresh backend after the
  * Space restarts — the browser-side UIMessages are what the user sees,
  * but the LLM needs the backend format to continue the conversation.

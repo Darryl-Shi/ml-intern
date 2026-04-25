@@ -17,12 +17,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
-import litellm
 from prompt_toolkit import PromptSession
 
 from agent.config import load_config
 from agent.core.agent_loop import submission_loop
 from agent.core import model_switcher
+from agent.core.provider import (
+    ProviderConfig,
+    apply_provider_to_config,
+    require_provider_config,
+    resolve_provider_config,
+    save_provider_config,
+)
 from agent.core.session import OpType
 from agent.core.tools import ToolRouter
 from agent.utils.reliability_checks import check_training_script_save_pattern
@@ -44,11 +50,6 @@ from agent.utils.terminal_display import (
     print_turn_complete,
     print_yolo_approve,
 )
-
-litellm.drop_params = True
-# Suppress the "Give Feedback / Get Help" banner LiteLLM prints to stderr
-# on every error — users don't need it, and our friendly errors cover the case.
-litellm.suppress_debug_info = True
 
 def _safe_get_args(arguments: dict) -> dict:
     """Safely extract args dict from arguments, handling cases where LLM passes string."""
@@ -81,46 +82,57 @@ def _get_hf_token() -> str | None:
     return None
 
 
-async def _prompt_and_save_hf_token(prompt_session: PromptSession) -> str:
-    """Prompt user for HF token, validate it, save via huggingface_hub.login(). Loops until valid."""
-    from prompt_toolkit.formatted_text import HTML
-    from huggingface_hub import HfApi, login
+async def _prompt_provider_config(
+    prompt_session: PromptSession,
+    existing: ProviderConfig | None = None,
+) -> ProviderConfig:
+    """Prompt for OpenAI-compatible provider settings and persist them."""
+    console = get_console()
+    console.print("\n[bold]OpenAI-compatible provider setup[/bold]")
+    console.print("[dim]These settings are saved to ~/.config/ml-intern/provider.json[/dim]\n")
 
-    print("\nA Hugging Face token is required.")
-    print("Get one at: https://huggingface.co/settings/tokens\n")
-
-    while True:
-        try:
-            token = await prompt_session.prompt_async(
-                HTML("<b>Paste your HF token: </b>")
+    async def ask(label: str, default: str | None = None, password: bool = False) -> str:
+        while True:
+            suffix = f" [{default}]" if default and not password else ""
+            value = await prompt_session.prompt_async(
+                f"{label}{suffix}: ",
+                is_password=password,
             )
-        except (EOFError, KeyboardInterrupt):
-            print("\nToken is required to continue.")
-            continue
+            value = value.strip()
+            if value:
+                return value
+            if default:
+                return default
+            console.print(f"[red]{label} is required.[/red]")
 
-        token = token.strip()
-        if not token:
-            print("Token cannot be empty.")
-            continue
+    base_url = await ask("Base URL", existing.base_url if existing else None)
+    model = await ask("Model", existing.model if existing else None)
+    api_key_default = existing.api_key if existing else None
+    api_key = await ask("API key", api_key_default, password=True)
+    context_default = str(existing.context_window if existing else 200_000)
+    context_raw = await ask("Context window", context_default)
+    try:
+        context_window = max(1_000, int(context_raw))
+    except ValueError:
+        context_window = existing.context_window if existing else 200_000
 
-        # Validate token against the API
-        try:
-            api = HfApi(token=token)
-            user_info = api.whoami()
-            username = user_info.get("name", "unknown")
-            print(f"Token valid (user: {username})")
-        except Exception:
-            print("Invalid token. Please try again.")
-            continue
+    provider = ProviderConfig(
+        model=model,
+        base_url=base_url.rstrip("/"),
+        api_key=api_key,
+        context_window=context_window,
+    )
+    save_provider_config(provider)
+    console.print("[green]Provider saved.[/green]")
+    return provider
 
-        # Save for future sessions
-        try:
-            login(token=token, add_to_git_credential=False)
-            print("Token saved to ~/.cache/huggingface/token")
-        except Exception as e:
-            print(f"Warning: could not persist token ({e}), using for this session only.")
 
-        return token
+async def _ensure_provider_config(config, prompt_session: PromptSession) -> ProviderConfig:
+    provider = resolve_provider_config(config)
+    if provider is None:
+        provider = await _prompt_provider_config(prompt_session)
+    apply_provider_to_config(config, provider)
+    return provider
 
 @dataclass
 class Operation:
@@ -712,8 +724,8 @@ async def _handle_slash_command(
     Handle a slash command. Returns a Submission to enqueue, or None if
     the command was handled locally (caller should set turn_complete_event).
 
-    Async because ``/model`` fires a probe ping to validate the model+effort
-    combo before committing the switch.
+    Async because ``/provider setup`` prompts for input before committing the
+    saved settings.
     """
     parts = cmd.strip().split(None, 1)
     command = parts[0].lower()
@@ -742,14 +754,32 @@ async def _handle_slash_command(
         if not arg:
             model_switcher.print_model_listing(config, console)
             return None
-        if not model_switcher.is_valid_model_id(arg):
-            model_switcher.print_invalid_id(arg, console)
-            return None
-        normalized = arg.removeprefix("huggingface/")
+        normalized = arg.strip()
         session = session_holder[0] if session_holder else None
-        await model_switcher.probe_and_switch_model(
-            normalized, config, session, console, _get_hf_token(),
-        )
+        model_switcher.switch_model(normalized, config, session, console)
+        return None
+
+    if command == "/provider":
+        console = get_console()
+        session = session_holder[0] if session_holder else None
+        existing = resolve_provider_config(config)
+        if arg.lower() == "setup":
+            prompt_session = PromptSession()
+            provider = await _prompt_provider_config(prompt_session, existing)
+            apply_provider_to_config(config, provider)
+            if session is not None:
+                session.update_model(provider.model)
+            return None
+        provider = resolve_provider_config(config)
+        if provider is None:
+            console.print("[yellow]No provider configured. Run /provider setup.[/yellow]")
+        else:
+            console.print("[bold]OpenAI-compatible provider:[/bold]")
+            console.print(f"  model: {provider.model}")
+            console.print(f"  base_url: {provider.base_url}")
+            console.print(f"  context_window: {provider.context_window}")
+            console.print(f"  api_key: {'set' if provider.api_key else 'missing'}")
+            console.print("[dim]Run /provider setup to edit saved settings.[/dim]")
         return None
 
     if command == "/yolo":
@@ -765,14 +795,9 @@ async def _handle_slash_command(
         if not arg:
             current = config.reasoning_effort or "off"
             console.print(f"[bold]Reasoning effort preference:[/bold] {current}")
-            if session and session.model_effective_effort:
-                console.print("[dim]Probed per model:[/dim]")
-                for m, eff in session.model_effective_effort.items():
-                    console.print(f"  [dim]{m}: {eff or 'off'}[/dim]")
             console.print(
                 "[dim]Set with '/effort minimal|low|medium|high|xhigh|max|off'. "
-                "'max' and 'xhigh' are Anthropic-only; the cascade falls back "
-                "to whatever the model actually accepts.[/dim]"
+                "OpenAI-compatible providers that reject the field are retried without it.[/dim]"
             )
             return None
         level = arg.lower()
@@ -781,21 +806,14 @@ async def _handle_slash_command(
             console.print(f"[dim]Expected one of: {', '.join(sorted(valid))}[/dim]")
             return None
         config.reasoning_effort = None if level == "off" else level
-        # Drop the per-model probe cache — the new preference may resolve
-        # differently. Next ``/model`` (or the retry safety net) reprobes.
-        if session is not None:
-            session.model_effective_effort.clear()
         console.print(f"[green]Reasoning effort: {level}[/green]")
-        if session is not None:
-            console.print(
-                "[dim]run /model <current> to re-probe, or send a message — "
-                "the agent adjusts automatically if the new level isn't supported.[/dim]"
-            )
         return None
 
     if command == "/status":
         session = session_holder[0] if session_holder else None
         print(f"Model: {config.model_name}")
+        provider = resolve_provider_config(config)
+        print(f"Base URL: {provider.base_url if provider else '(not configured)'}")
         print(f"Reasoning effort: {config.reasoning_effort or 'off'}")
         if session:
             print(f"Turns: {session.turn_count}")
@@ -815,10 +833,12 @@ async def main():
     # Create prompt session for input (needed early for token prompt)
     prompt_session = PromptSession()
 
-    # HF token — required, prompt if missing
+    config_path = Path(__file__).parent.parent / "configs" / "main_agent_config.json"
+    config = load_config(config_path)
+    await _ensure_provider_config(config, prompt_session)
+
+    # HF token is used only for Hugging Face tools/jobs/repos.
     hf_token = _get_hf_token()
-    if not hf_token:
-        hf_token = await _prompt_and_save_hf_token(prompt_session)
 
     # Resolve username for banner
     hf_user = None
@@ -828,12 +848,7 @@ async def main():
     except Exception:
         pass
 
-    print_banner(hf_user=hf_user)
-
-    # Pre-warm the HF router catalog in the background so /model switches
-    # don't block on a network fetch.
-    from agent.core import hf_router_catalog
-    asyncio.create_task(asyncio.to_thread(hf_router_catalog.prewarm))
+    print_banner(model=config.model_name, hf_user=hf_user)
 
     # Create queues for communication
     submission_queue = asyncio.Queue()
@@ -843,10 +858,6 @@ async def main():
     turn_complete_event = asyncio.Event()
     turn_complete_event.set()
     ready_event = asyncio.Event()
-
-    # Start agent loop in background
-    config_path = Path(__file__).parent.parent / "configs" / "main_agent_config.json"
-    config = load_config(config_path)
 
     # Create tool router with local mode
     tool_router = ToolRouter(config.mcpServers, hf_token=hf_token, local_mode=True)
@@ -1038,16 +1049,25 @@ async def headless_main(
     logging.basicConfig(level=logging.WARNING)
 
     hf_token = _get_hf_token()
-    if not hf_token:
-        print("ERROR: No HF token found. Set HF_TOKEN or run `huggingface-cli login`.", file=sys.stderr)
-        sys.exit(1)
-
-    print(f"HF token loaded", file=sys.stderr)
+    if hf_token:
+        print("HF token loaded", file=sys.stderr)
+    else:
+        print("HF token not set; Hugging Face tools may require login.", file=sys.stderr)
 
     config_path = Path(__file__).parent.parent / "configs" / "main_agent_config.json"
     config = load_config(config_path)
     config.yolo_mode = True  # Auto-approve everything in headless mode
 
+    if model:
+        config.model_name = model
+
+    try:
+        provider = require_provider_config(config)
+    except Exception as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        print("Run `ml-intern` interactively and use /provider setup, or set OPENAI_BASE_URL, OPENAI_API_KEY, and OPENAI_MODEL.", file=sys.stderr)
+        sys.exit(1)
+    apply_provider_to_config(config, provider)
     if model:
         config.model_name = model
 
@@ -1221,8 +1241,6 @@ def cli():
     import warnings
     # Suppress aiohttp "Unclosed client session" noise during event loop teardown
     _logging.getLogger("asyncio").setLevel(_logging.CRITICAL)
-    # Suppress litellm pydantic deprecation warnings
-    warnings.filterwarnings("ignore", category=DeprecationWarning, module="litellm")
     # Suppress whoosh invalid escape sequence warnings (third-party, unfixed upstream)
     warnings.filterwarnings("ignore", category=SyntaxWarning, module="whoosh")
 

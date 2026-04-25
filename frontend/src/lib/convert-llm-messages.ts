@@ -1,5 +1,5 @@
 /**
- * Convert backend LLM messages (litellm format) to Vercel AI SDK UIMessage format.
+ * Convert backend OpenAI-compatible messages to Vercel AI SDK UIMessage format.
  */
 import type { UIMessage } from 'ai';
 

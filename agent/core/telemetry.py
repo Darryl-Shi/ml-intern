@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # ── usage extraction ────────────────────────────────────────────────────────
 
 def extract_usage(response_or_chunk: Any) -> dict:
-    """Flat usage dict from a litellm response or final-chunk usage object.
+    """Flat usage dict from an OpenAI-compatible response or usage chunk.
 
     Normalizes across providers: Anthropic exposes cache tokens as
     ``cache_read_input_tokens`` / ``cache_creation_input_tokens``; OpenAI uses
@@ -83,12 +83,6 @@ async def record_llm_call(
     callers can stash it on their result object if they want."""
     usage = extract_usage(response) if response is not None else {}
     cost_usd = 0.0
-    if response is not None:
-        try:
-            from litellm import completion_cost
-            cost_usd = float(completion_cost(completion_response=response) or 0.0)
-        except Exception:
-            cost_usd = 0.0
     from agent.core.session import Event  # local import to avoid cycle
     try:
         await session.send_event(Event(

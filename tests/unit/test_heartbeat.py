@@ -16,7 +16,7 @@ from agent.core.session import Event, Session
 
 
 class _FakeConfig:
-    model_name = "claude-opus-4-6"
+    model_name = "gpt-4o-mini"
     save_sessions = True
     session_dataset_repo = "fake/repo"
     auto_save_interval = 1
@@ -32,7 +32,7 @@ class _FakeConfig:
 def _mk_session(tmp_path: Path) -> Session:
     import os
     os.chdir(tmp_path)  # so session_logs/ lands under tmp_path
-    # Stub out the context manager to avoid litellm lookups.
+    # Stub out the context manager; heartbeat does not need real provider setup.
     from agent.context_manager.manager import ContextManager
     cm = ContextManager.__new__(ContextManager)
     cm.items = []

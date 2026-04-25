@@ -10,7 +10,7 @@ import json
 import logging
 from dataclasses import dataclass
 
-from litellm import Message
+from agent.core.message import Message
 
 logger = logging.getLogger(__name__)
 

@@ -4,11 +4,17 @@
 
 # ML Intern
 
-An ML intern that autonomously researches, writes, and ships good quality ML releated code using the Hugging Face ecosystem — with deep access to docs, papers, datasets, and cloud compute.
+ML Intern is an agent for ML engineering work. It can research Hugging Face
+docs, papers, models, datasets, and repositories, write code, run local tools,
+launch HF jobs, and keep a resumable session trace while it works.
+
+The runtime is provider-neutral: bring any OpenAI-compatible chat completions
+endpoint, model name, base URL, and API key. The CLI is the primary interface;
+the web app uses the same backend and provider contract.
 
 ## Quick Start
 
-### Installation
+Install with UV:
 
 ```bash
 git clone git@github.com:huggingface/ml-intern.git
@@ -17,204 +23,252 @@ uv sync
 uv tool install -e .
 ```
 
-#### That's it. Now `ml-intern` works from any directory:
+Start the CLI:
 
 ```bash
 ml-intern
 ```
 
-Create a `.env` file in the project root (or export these in your shell):
+On first launch, if no provider is configured, ML Intern opens a provider setup
+wizard. It saves the result to:
+
+```text
+~/.config/ml-intern/provider.json
+```
+
+The saved file includes the API key and is written with file mode `0600`.
+
+You can also configure the provider with environment variables:
 
 ```bash
-ANTHROPIC_API_KEY=<your-anthropic-api-key> # if using anthropic models
+OPENAI_BASE_URL=https://api.openai.com/v1
+OPENAI_API_KEY=<your-provider-api-key>
+OPENAI_MODEL=gpt-4o-mini
+OPENAI_CONTEXT_WINDOW=200000 # optional
+```
+
+`OPENAI_*` environment variables take precedence over the saved provider file.
+
+## Optional Tokens
+
+ML Intern can start without a Hugging Face token. Some tools are more useful
+when authenticated:
+
+```bash
 HF_TOKEN=<your-hugging-face-token>
-GITHUB_TOKEN=<github-personal-access-token> 
+GITHUB_TOKEN=<github-personal-access-token>
 ```
-If no `HF_TOKEN` is set, the CLI will prompt you to paste one on first launch. To get a GITHUB_TOKEN follow the tutorial [here](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens#creating-a-fine-grained-personal-access-token).
 
-### Usage
+Use `HF_TOKEN` for private Hub access, job submission, and authenticated HF API
+calls. Use `GITHUB_TOKEN` for GitHub search or repository operations that need
+auth.
 
-**Interactive mode** (start a chat session):
+## CLI Usage
+
+Interactive mode:
 
 ```bash
 ml-intern
 ```
 
-**Headless mode** (single prompt, auto-approve):
+Headless mode with auto-approval:
 
 ```bash
 ml-intern "fine-tune llama on my dataset"
 ```
 
-**Options:**
+Common options:
 
 ```bash
-ml-intern --model anthropic/claude-opus-4-6 "your prompt"
+ml-intern --model gpt-4o-mini "your prompt"
 ml-intern --max-iterations 100 "your prompt"
 ml-intern --no-stream "your prompt"
 ```
 
-## Architecture
+`--model` changes only the model name for that run. The base URL and API key
+still come from the environment, saved provider file, or interactive setup.
 
-### Component Overview
+### Slash Commands
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                         User/CLI                            │
-└────────────┬─────────────────────────────────────┬──────────┘
-             │ Operations                          │ Events
-             ↓ (user_input, exec_approval,         ↑
-      submission_queue  interrupt, compact, ...)  event_queue
-             │                                          │
-             ↓                                          │
-┌────────────────────────────────────────────────────┐  │
-│            submission_loop (agent_loop.py)         │  │
-│  ┌──────────────────────────────────────────────┐  │  │
-│  │  1. Receive Operation from queue             │  │  │
-│  │  2. Route to handler (run_agent/compact/...) │  │  │
-│  └──────────────────────────────────────────────┘  │  │
-│                      ↓                             │  │
-│  ┌──────────────────────────────────────────────┐  │  │
-│  │         Handlers.run_agent()                 │  ├──┤
-│  │                                              │  │  │
-│  │  ┌────────────────────────────────────────┐  │  │  │
-│  │  │  Agentic Loop (max 300 iterations)     │  │  │  │
-│  │  │                                        │  │  │  │
-│  │  │  ┌──────────────────────────────────┐  │  │  │  │
-│  │  │  │ Session                          │  │  │  │  │
-│  │  │  │  ┌────────────────────────────┐  │  │  │  │  │
-│  │  │  │  │ ContextManager             │  │  │  │  │  │
-│  │  │  │  │ • Message history          │  │  │  │  │  │
-│  │  │  │  │   (litellm.Message[])      │  │  │  │  │  │
-│  │  │  │  │ • Auto-compaction (170k)   │  │  │  │  │  │
-│  │  │  │  │ • Session upload to HF     │  │  │  │  │  │
-│  │  │  │  └────────────────────────────┘  │  │  │  │  │
-│  │  │  │                                  │  │  │  │  │
-│  │  │  │  ┌────────────────────────────┐  │  │  │  │  │
-│  │  │  │  │ ToolRouter                 │  │  │  │  │  │
-│  │  │  │  │  ├─ HF docs & research     │  │  │  │  │  │
-│  │  │  │  │  ├─ HF repos, datasets,    │  │  │  │  │  │
-│  │  │  │  │  │  jobs, papers           │  │  │  │  │  │
-│  │  │  │  │  ├─ GitHub code search     │  │  │  │  │  │
-│  │  │  │  │  ├─ Sandbox & local tools  │  │  │  │  │  │
-│  │  │  │  │  ├─ Planning               │  │  │  │  │  │
-│  │  │  │  │  └─ MCP server tools       │  │  │  │  │  │
-│  │  │  │  └────────────────────────────┘  │  │  │  │  │
-│  │  │  └──────────────────────────────────┘  │  │  │  │
-│  │  │                                        │  │  │  │
-│  │  │  ┌──────────────────────────────────┐  │  │  │  │
-│  │  │  │ Doom Loop Detector               │  │  │  │  │
-│  │  │  │ • Detects repeated tool patterns │  │  │  │  │
-│  │  │  │ • Injects corrective prompts     │  │  │  │  │
-│  │  │  └──────────────────────────────────┘  │  │  │  │
-│  │  │                                        │  │  │  │
-│  │  │  Loop:                                 │  │  │  │
-│  │  │    1. LLM call (litellm.acompletion)   │  │  │  │
-│  │  │       ↓                                │  │  │  │
-│  │  │    2. Parse tool_calls[]               │  │  │  │
-│  │  │       ↓                                │  │  │  │
-│  │  │    3. Approval check                   │  │  │  │
-│  │  │       (jobs, sandbox, destructive ops) │  │  │  │
-│  │  │       ↓                                │  │  │  │
-│  │  │    4. Execute via ToolRouter           │  │  │  │
-│  │  │       ↓                                │  │  │  │
-│  │  │    5. Add results to ContextManager    │  │  │  │
-│  │  │       ↓                                │  │  │  │
-│  │  │    6. Repeat if tool_calls exist       │  │  │  │
-│  │  └────────────────────────────────────────┘  │  │  │
-│  └──────────────────────────────────────────────┘  │  │
-└────────────────────────────────────────────────────┴──┘
+Inside the CLI:
+
+| Command | Purpose |
+| --- | --- |
+| `/provider` | Show the active OpenAI-compatible provider. |
+| `/provider setup` | Configure base URL, model, API key, and context window. |
+| `/model` | Show the current model. |
+| `/model <name>` | Switch the model for the current provider. |
+| `/effort <level>` | Set reasoning effort: `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or `off`. |
+| `/compact` | Summarize older context and continue in the same session. |
+| `/undo` | Remove the last turn from context. |
+| `/status` | Show model, provider, reasoning effort, turns, and context items. |
+| `/yolo` | Toggle auto-approval for tool calls. |
+| `/help` | Show CLI help. |
+
+## Web App
+
+Install frontend dependencies:
+
+```bash
+cd frontend
+npm install
 ```
 
-### Agentic Loop Flow
+Build the frontend:
 
-```
-User Message
-     ↓
-[Add to ContextManager]
-     ↓
-     ╔═══════════════════════════════════════════╗
-     ║      Iteration Loop (max 300)             ║
-     ║                                           ║
-     ║  Get messages + tool specs                ║
-     ║         ↓                                 ║
-     ║  litellm.acompletion()                    ║
-     ║         ↓                                 ║
-     ║  Has tool_calls? ──No──> Done             ║
-     ║         │                                 ║
-     ║        Yes                                ║
-     ║         ↓                                 ║
-     ║  Add assistant msg (with tool_calls)      ║
-     ║         ↓                                 ║
-     ║  Doom loop check                          ║
-     ║         ↓                                 ║
-     ║  For each tool_call:                      ║
-     ║    • Needs approval? ──Yes──> Wait for    ║
-     ║    │                         user confirm ║
-     ║    No                                     ║
-     ║    ↓                                      ║
-     ║    • ToolRouter.execute_tool()            ║
-     ║    • Add result to ContextManager         ║
-     ║         ↓                                 ║
-     ║  Continue loop ─────────────────┐         ║
-     ║         ↑                       │         ║
-     ║         └───────────────────────┘         ║
-     ╚═══════════════════════════════════════════╝
+```bash
+npm run build
 ```
 
-## Events
+Run the backend from the repo root:
 
-The agent emits the following events via `event_queue`:
-
-- `processing` - Starting to process user input
-- `ready` - Agent is ready for input
-- `assistant_chunk` - Streaming token chunk
-- `assistant_message` - Complete LLM response text
-- `assistant_stream_end` - Token stream finished
-- `tool_call` - Tool being called with arguments
-- `tool_output` - Tool execution result
-- `tool_log` - Informational tool log message
-- `tool_state_change` - Tool execution state transition
-- `approval_required` - Requesting user approval for sensitive operations
-- `turn_complete` - Agent finished processing
-- `error` - Error occurred during processing
-- `interrupted` - Agent was interrupted
-- `compacted` - Context was compacted
-- `undo_complete` - Undo operation completed
-- `shutdown` - Agent shutting down
-
-## Development
-
-### Adding Built-in Tools
-
-Edit `agent/core/tools.py`:
-
-```python
-def create_builtin_tools() -> list[ToolSpec]:
-    return [
-        ToolSpec(
-            name="your_tool",
-            description="What your tool does",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "param": {"type": "string", "description": "Parameter description"}
-                },
-                "required": ["param"]
-            },
-            handler=your_async_handler
-        ),
-        # ... existing tools
-    ]
+```bash
+cd backend
+uv run uvicorn main:app --host 0.0.0.0 --port 7860
 ```
 
-### Adding MCP Servers
+The production Docker image builds the frontend into `static/` and serves the
+FastAPI app on port `7860`.
 
-Edit `configs/main_agent_config.json`:
+The browser stores provider settings in local storage and sends them to the
+backend when creating or updating sessions. The backend redacts API keys in
+session metadata responses.
+
+## Provider Resolution
+
+Provider settings are resolved in this order:
+
+1. `OPENAI_BASE_URL`, `OPENAI_API_KEY`, `OPENAI_MODEL`, and optional `OPENAI_CONTEXT_WINDOW`.
+2. Runtime/session config passed by the web app.
+3. `~/.config/ml-intern/provider.json`.
+
+The provider must expose an OpenAI-compatible chat completions API. Tool calls
+are sent using the OpenAI `tools` schema.
+
+## Configuration
+
+The default config lives at:
+
+```text
+configs/main_agent_config.json
+```
+
+Minimal provider-aware config:
 
 ```json
 {
-  "model_name": "anthropic/claude-sonnet-4-5-20250929",
+  "model_name": "${OPENAI_MODEL:-gpt-4o-mini}",
+  "openai_base_url": "${OPENAI_BASE_URL:-}",
+  "openai_api_key": "${OPENAI_API_KEY:-}",
+  "openai_context_window": 200000,
+  "mcpServers": {}
+}
+```
+
+Environment variables in the form `${VAR}` and `${VAR:-default}` are expanded
+from `.env` and the shell environment.
+
+## Architecture
+
+The core loop is queue-based:
+
+```text
+CLI or Web UI
+  -> submission queue
+  -> agent loop
+  -> OpenAI-compatible provider
+  -> tool calls
+  -> context manager
+  -> event queue
+  -> CLI renderer or SSE stream
+```
+
+Main pieces:
+
+| Path | Role |
+| --- | --- |
+| `agent/main.py` | First-class CLI, slash commands, provider setup, headless mode. |
+| `agent/core/provider.py` | Provider config, saved config, OpenAI SDK client, chat completion wrapper. |
+| `agent/core/message.py` | Internal message and tool-call models serialized to OpenAI chat dictionaries. |
+| `agent/core/agent_loop.py` | Iterative agent loop, streaming, tool execution, approvals, retries. |
+| `agent/context_manager/manager.py` | Message history, compaction, restore summaries, system prompt rendering. |
+| `agent/core/tools.py` | Tool router and tool spec conversion. |
+| `backend/` | FastAPI app, auth, sessions, SSE, provider-aware REST endpoints. |
+| `frontend/` | React UI, session management, chat transport, browser provider settings. |
+
+## Events
+
+The agent emits events through an in-memory event queue. The CLI renders them
+directly; the web backend streams them as SSE.
+
+Common event types:
+
+- `processing`
+- `ready`
+- `assistant_chunk`
+- `assistant_message`
+- `assistant_stream_end`
+- `tool_call`
+- `tool_output`
+- `tool_log`
+- `tool_state_change`
+- `approval_required`
+- `turn_complete`
+- `error`
+- `interrupted`
+- `compacted`
+- `undo_complete`
+- `shutdown`
+
+## Development
+
+Use UV for Python interpreter and dependency management:
+
+```bash
+uv sync --extra dev
+uv run --extra dev pytest tests/unit
+uv run python -m compileall agent backend
+```
+
+Frontend checks:
+
+```bash
+cd frontend
+npm run build
+```
+
+Refresh the lockfile after dependency changes:
+
+```bash
+uv lock
+```
+
+## Adding Tools
+
+Built-in tools are registered through `agent/core/tools.py`. A tool needs a
+name, description, JSON schema, and async handler:
+
+```python
+ToolSpec(
+    name="your_tool",
+    description="What your tool does",
+    parameters={
+        "type": "object",
+        "properties": {
+            "param": {"type": "string", "description": "Parameter description"}
+        },
+        "required": ["param"],
+    },
+    handler=your_async_handler,
+)
+```
+
+## Adding MCP Servers
+
+Add MCP servers to `configs/main_agent_config.json`:
+
+```json
+{
   "mcpServers": {
     "your-server-name": {
       "transport": "http",
@@ -227,4 +281,4 @@ Edit `configs/main_agent_config.json`:
 }
 ```
 
-Note: Environment variables like `${YOUR_TOKEN}` are auto-substituted from `.env`.
+Secrets can be referenced with environment variables and loaded from `.env`.

@@ -19,33 +19,8 @@ _DEFAULT_MAX_TOKENS = 200_000
 
 
 def _get_max_tokens_safe(model_name: str) -> int:
-    """Return the max input-context tokens for a model.
-
-    Primary source: ``litellm.get_model_info(model)['max_input_tokens']`` —
-    LiteLLM maintains an upstream catalog that knows Claude Opus 4.6 is
-    1M, GPT-5 is 272k, Sonnet 4.5 is 200k, and so on. Strips any HF routing
-    suffix / huggingface/ prefix so tagged ids ('moonshotai/Kimi-K2.6:cheapest')
-    look up the bare model. Falls back to a conservative 200k default for
-    models not in the catalog (typically HF-router-only models).
-    """
-    from litellm import get_model_info
-
-    candidates = [model_name]
-    stripped = model_name.removeprefix("huggingface/").split(":", 1)[0]
-    if stripped != model_name:
-        candidates.append(stripped)
-    for candidate in candidates:
-        try:
-            info = get_model_info(candidate)
-            max_input = info.get("max_input_tokens") if info else None
-            if isinstance(max_input, int) and max_input > 0:
-                return max_input
-        except Exception:
-            continue
-    logger.info(
-        "No litellm.get_model_info entry for %s, falling back to %d",
-        model_name, _DEFAULT_MAX_TOKENS,
-    )
+    """Return the configured/default max input-context tokens for a model."""
+    logger.info("Using default context window for %s: %d", model_name, _DEFAULT_MAX_TOKENS)
     return _DEFAULT_MAX_TOKENS
 
 
@@ -85,7 +60,8 @@ class Session:
         self.stream = stream
         tool_specs = tool_router.get_tool_specs_for_llm() if tool_router else []
         self.context_manager = context_manager or ContextManager(
-            model_max_tokens=_get_max_tokens_safe(config.model_name),
+            model_max_tokens=getattr(config, "openai_context_window", None)
+            or _get_max_tokens_safe(config.model_name),
             compact_size=0.1,
             untouched_messages=5,
             tool_specs=tool_specs,
@@ -95,7 +71,7 @@ class Session:
         self.event_queue = event_queue
         self.session_id = str(uuid.uuid4())
         self.config = config or Config(
-            model_name="bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+            model_name="gpt-4o-mini",
         )
         self.is_running = True
         self._cancelled = asyncio.Event()
@@ -114,14 +90,12 @@ class Session:
         self._local_save_path: Optional[str] = None
         self._last_heartbeat_ts: Optional[float] = None
 
-        # Per-model probed reasoning-effort cache. Populated by the probe
-        # on /model switch, read by ``effective_effort_for`` below. Keys are
+        # Per-model reasoning-effort cache. Populated when a provider rejects
+        # reasoning fields, read by ``effective_effort_for`` below. Keys are
         # raw model ids (including any ``:tag``). Values:
-        #   str  → the effort level to send (may be a downgrade from the
-        #          preference, e.g. "high" when user asked for "max")
-        #   None → model rejected all efforts in the cascade; send no
-        #          thinking params at all
-        # Key absent → not probed yet; fall back to the raw preference.
+        #   str  -> the effort level to send
+        #   None -> model rejected reasoning fields; send no thinking params
+        # Key absent -> fall back to the raw preference.
         self.model_effective_effort: dict[str, str | None] = {}
 
     async def send_event(self, event: Event) -> None:
@@ -156,15 +130,18 @@ class Session:
     def update_model(self, model_name: str) -> None:
         """Switch the active model and update the context window limit."""
         self.config.model_name = model_name
-        self.context_manager.model_max_tokens = _get_max_tokens_safe(model_name)
+        self.context_manager.model_max_tokens = (
+            getattr(self.config, "openai_context_window", None)
+            or _get_max_tokens_safe(model_name)
+        )
 
     def effective_effort_for(self, model_name: str) -> str | None:
         """Resolve the effort level to actually send for ``model_name``.
 
-        Returns the probed result when we have one (may be ``None`` meaning
+        Returns the cached result when we have one (may be ``None`` meaning
         "model doesn't do thinking, strip it"), else the raw preference.
         Unknown-model case falls back to the preference so a stale cache
-        from a prior ``/model`` can't poison research sub-calls that use a
+        from a prior failed call can't poison research sub-calls that use a
         different model id.
         """
         if model_name in self.model_effective_effort:
