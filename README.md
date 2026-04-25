@@ -103,6 +103,11 @@ Resume the exact message history from a prior session:
 ml-intern --resume session_logs/session_<id>_<timestamp>.json
 ```
 
+Inside the CLI, run `/resume` to open a selector for recent files in
+`session_logs/`. You can choose by number or enter a path. If the selected
+session has local checkpoints, ML Intern asks whether to restore the working
+directory from the latest checkpoint.
+
 Resume and restore the local directory to the latest saved checkpoint:
 
 ```bash
@@ -125,6 +130,7 @@ Inside the CLI:
 
 | Command | Purpose |
 | --- | --- |
+| `/resume` | Open a selector for saved session logs and resume one. |
 | `/provider` | Show the active OpenAI-compatible provider. |
 | `/provider setup` | Configure base URL, model, API key, and context window. |
 | `/model` | Show the current model. |

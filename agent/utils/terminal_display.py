@@ -437,6 +437,7 @@ def print_yolo_approve(count: int) -> None:
 HELP_TEXT = f"""\
 {_I}[bold]Commands[/bold]
 {_I}  [cyan]/help[/cyan]            Show this help
+{_I}  [cyan]/resume[/cyan]          Pick a saved session to resume
 {_I}  [cyan]/undo[/cyan]            Undo last turn
 {_I}  [cyan]/history[/cyan]         List restore points
 {_I}  [cyan]/restore[/cyan] [turn]  Restore messages and local files

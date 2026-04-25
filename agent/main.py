@@ -184,6 +184,141 @@ def _load_resume_trajectory(path: str | Path) -> dict[str, Any]:
     return data
 
 
+def _last_user_preview(raw_messages: list[Any]) -> str:
+    for raw in reversed(raw_messages):
+        if not isinstance(raw, dict) or raw.get("role") != "user":
+            continue
+        content = raw.get("content")
+        if not isinstance(content, str) or not content.strip():
+            continue
+        if content.startswith("[SYSTEM:"):
+            continue
+        return content.replace("\n", " ")[:90]
+    return ""
+
+
+def _session_log_candidates(
+    directory: str | Path = "session_logs",
+    *,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    log_dir = Path(directory)
+    if not log_dir.exists():
+        return []
+
+    candidates: list[dict[str, Any]] = []
+    for path in log_dir.glob("session_*.json"):
+        try:
+            with open(path, "r") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                continue
+            messages = data.get("messages") or []
+            local_state = data.get("local_state") or {}
+            candidates.append(
+                {
+                    "path": path.resolve(),
+                    "mtime": path.stat().st_mtime,
+                    "session_id": data.get("session_id", "?"),
+                    "model": data.get("model_name", "?"),
+                    "message_count": len(messages),
+                    "checkpoint_count": len(local_state.get("checkpoints") or []),
+                    "last_save_time": data.get("last_save_time")
+                    or data.get("session_end_time")
+                    or "",
+                    "preview": _last_user_preview(messages),
+                }
+            )
+        except Exception:
+            continue
+
+    candidates.sort(key=lambda item: item["mtime"], reverse=True)
+    return candidates[:limit]
+
+
+def _print_resume_candidates(candidates: list[dict[str, Any]]) -> None:
+    console = get_console()
+    console.print("[bold]Saved sessions[/bold]")
+    for index, item in enumerate(candidates, start=1):
+        saved = item["last_save_time"] or "unknown time"
+        preview = f" - {item['preview']}" if item["preview"] else ""
+        checkpoints = item["checkpoint_count"]
+        checkpoint_text = f"{checkpoints} checkpoint" + ("" if checkpoints == 1 else "s")
+        console.print(
+            f"  [cyan]{index}[/cyan]  {saved}  [dim]{item['model']} · "
+            f"{item['message_count']} messages · {checkpoint_text}{preview}[/dim]"
+        )
+        console.print(f"     [dim]{item['path']}[/dim]")
+
+
+async def _handle_resume_command(
+    prompt_session: PromptSession,
+    session,
+    arg: str = "",
+) -> None:
+    console = get_console()
+    if session is None:
+        console.print("[yellow]Session is still starting.[/yellow]")
+        return
+
+    selected_path: Path | None = Path(arg).expanduser() if arg else None
+    candidates: list[dict[str, Any]] = []
+    if selected_path is None:
+        candidates = _session_log_candidates()
+        if not candidates:
+            console.print("[yellow]No saved sessions found in session_logs/.[/yellow]")
+            return
+        _print_resume_candidates(candidates)
+        answer = await prompt_session.prompt_async(
+            "Resume session (number/path, Enter = cancel): "
+        )
+        answer = answer.strip()
+        if not answer:
+            console.print("[dim]Resume cancelled.[/dim]")
+            return
+        if answer.isdigit():
+            index = int(answer)
+            if index < 1 or index > len(candidates):
+                console.print(f"[red]Invalid session number:[/red] {answer}")
+                return
+            selected_path = Path(candidates[index - 1]["path"])
+        else:
+            selected_path = Path(answer).expanduser()
+
+    try:
+        trajectory = _load_resume_trajectory(selected_path)
+    except Exception as e:
+        console.print(f"[red]Could not load session:[/red] {e}")
+        return
+
+    checkpoint_count = len(
+        ((trajectory.get("local_state") or {}).get("checkpoints") or [])
+    )
+    restore_local_state = False
+    if checkpoint_count:
+        answer = await prompt_session.prompt_async(
+            f"Restore local directory from latest checkpoint? "
+            f"({checkpoint_count} available) [y/N]: "
+        )
+        restore_local_state = answer.strip().lower() in {"y", "yes"}
+
+    try:
+        _hydrate_session_from_trajectory(
+            session,
+            trajectory,
+            restore_local_state=restore_local_state,
+        )
+    except Exception as e:
+        console.print(f"[red]Could not resume session:[/red] {e}")
+        return
+
+    _print_resume_summary(
+        session,
+        trajectory["_resume_path"],
+        restored=restore_local_state,
+    )
+
+
 def _derive_turn_count(messages: list, events: list[dict[str, Any]]) -> int:
     completed = sum(1 for event in events if event.get("event_type") == "turn_complete")
     if completed:
@@ -912,6 +1047,7 @@ async def _handle_slash_command(
     session_holder: list,
     submission_queue: asyncio.Queue,
     submission_id: list[int],
+    prompt_session: PromptSession,
 ) -> Submission | None:
     """
     Handle a slash command. Returns a Submission to enqueue, or None if
@@ -948,6 +1084,14 @@ async def _handle_slash_command(
 
     if command == "/restore":
         _restore_turn(session_holder[0] if session_holder else None, arg)
+        return None
+
+    if command == "/resume":
+        await _handle_resume_command(
+            prompt_session,
+            session_holder[0] if session_holder else None,
+            arg,
+        )
         return None
 
     if command == "/rewind":
@@ -1239,7 +1383,12 @@ async def main(
             # Handle slash commands
             if user_input.strip().startswith("/"):
                 sub = await _handle_slash_command(
-                    user_input.strip(), config, session_holder, submission_queue, submission_id
+                    user_input.strip(),
+                    config,
+                    session_holder,
+                    submission_queue,
+                    submission_id,
+                    prompt_session,
                 )
                 if sub is None:
                     # Command handled locally, loop back for input
