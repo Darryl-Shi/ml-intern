@@ -4,7 +4,7 @@
 
 # ML Intern
 
-An ML intern that autonomously researches, writes, and ships good quality ML-related code using the Hugging Face ecosystem — with deep access to docs, papers, datasets, and cloud compute.
+An ML intern that autonomously researches, writes, and ships good quality ML releated code using the Hugging Face ecosystem — with deep access to docs, papers, datasets, and cloud compute.
 
 ## Quick Start
 
@@ -26,12 +26,9 @@ ml-intern
 Create a `.env` file in the project root (or export these in your shell):
 
 ```bash
+ANTHROPIC_API_KEY=<your-anthropic-api-key> # if using anthropic models
 HF_TOKEN=<your-hugging-face-token>
-GITHUB_TOKEN=<github-personal-access-token>
-
-# Optional: only needed when using provider-specific built-in models.
-ANTHROPIC_API_KEY=<your-anthropic-api-key>
-OPENAI_API_KEY=<your-openai-api-key>
+GITHUB_TOKEN=<github-personal-access-token> 
 ```
 If no `HF_TOKEN` is set, the CLI will prompt you to paste one on first launch. To get a GITHUB_TOKEN follow the tutorial [here](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens#creating-a-fine-grained-personal-access-token).
 
@@ -55,58 +52,6 @@ ml-intern "fine-tune llama on my dataset"
 ml-intern --model anthropic/claude-opus-4-6 "your prompt"
 ml-intern --max-iterations 100 "your prompt"
 ml-intern --no-stream "your prompt"
-```
-
-### Models and Providers
-
-ML Intern uses [LiteLLM](https://docs.litellm.ai/) for model calls. The default config routes through the Hugging Face Router, but you can also use direct provider prefixes in the CLI:
-
-```bash
-ml-intern --model moonshotai/Kimi-K2.6
-ml-intern --model anthropic/claude-opus-4-6
-ml-intern --model openai/gpt-5.1
-```
-
-In the interactive CLI, run `/model` to see suggested models or switch during a session. Hugging Face Router model IDs can include routing suffixes such as `:fastest`, `:cheapest`, `:preferred`, or `:<provider>`.
-
-The web app also supports session-scoped custom OpenAI-compatible providers:
-
-1. Start or open a chat session.
-2. Click the `powered by` model selector under the composer.
-3. Choose `Custom provider`.
-4. Enter:
-   - `Label` - optional display name.
-   - `Model` - the model name to send to the provider.
-   - `Base URL` - an OpenAI-compatible `/v1` endpoint.
-   - `API key` - the provider key for this session.
-
-Custom provider keys are kept only in the backend session memory. They are not saved in browser localStorage, session metadata, or uploaded trajectories. If the backend restarts or the session is recreated, re-enter the key or switch back to a built-in model.
-
-Custom providers are treated as user-billed. They do not consume the hosted Claude quota and are not subject to the built-in Claude staff gate.
-
-### Web/API Model Selection
-
-The model endpoint accepts either a built-in model ID:
-
-```bash
-curl -X POST http://localhost:8000/api/session/<session-id>/model \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"moonshotai/Kimi-K2.6"}'
-```
-
-or a session-scoped custom OpenAI-compatible provider:
-
-```bash
-curl -X POST http://localhost:8000/api/session/<session-id>/model \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "custom_provider": {
-      "label": "Local vLLM",
-      "model": "meta-llama/Llama-3.1-8B-Instruct",
-      "base_url": "http://localhost:8001/v1",
-      "api_key": "sk-local"
-    }
-  }'
 ```
 
 ## Architecture
@@ -143,12 +88,6 @@ curl -X POST http://localhost:8000/api/session/<session-id>/model \
 │  │  │  │  │   (litellm.Message[])      │  │  │  │  │  │
 │  │  │  │  │ • Auto-compaction (170k)   │  │  │  │  │  │
 │  │  │  │  │ • Session upload to HF     │  │  │  │  │  │
-│  │  │  │  └────────────────────────────┘  │  │  │  │  │
-│  │  │  │  ┌────────────────────────────┐  │  │  │  │  │
-│  │  │  │  │ Model Provider             │  │  │  │  │  │
-│  │  │  │  │ • Built-in HF/Claude/OpenAI │  │  │  │  │  │
-│  │  │  │  │ • Session custom endpoint  │  │  │  │  │  │
-│  │  │  │  │ • LiteLLM params resolver  │  │  │  │  │  │
 │  │  │  │  └────────────────────────────┘  │  │  │  │  │
 │  │  │  │                                  │  │  │  │  │
 │  │  │  │  ┌────────────────────────────┐  │  │  │  │  │
@@ -289,13 +228,3 @@ Edit `configs/main_agent_config.json`:
 ```
 
 Note: Environment variables like `${YOUR_TOKEN}` are auto-substituted from `.env`.
-
-### Provider Implementation Notes
-
-Provider-specific LiteLLM kwargs live in `agent/core/llm_params.py`. Session-scoped custom provider metadata is stored on `Session.custom_provider` and threaded through the agent loop, context compaction, and restore-summary paths. Public session metadata intentionally returns only non-secret fields: `model`, `base_url`, and optional `label`.
-
-When adding a new built-in model, keep these places aligned:
-
-- `AVAILABLE_MODELS` in `backend/routes/agent.py`
-- `MODEL_OPTIONS` in `frontend/src/components/Chat/ChatInput.tsx`
-- shared constants in `frontend/src/utils/model.ts` when changing the first free model or Claude escape hatch

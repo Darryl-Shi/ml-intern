@@ -102,7 +102,6 @@ async def summarize_messages(
     max_tokens: int = 2000,
     tool_specs: list[dict] | None = None,
     prompt: str = _COMPACT_PROMPT,
-    custom_provider: dict | None = None,
 ) -> tuple[str, int]:
     """Run a summarization prompt against a list of messages.
 
@@ -116,12 +115,7 @@ async def summarize_messages(
     from agent.core.llm_params import _resolve_llm_params
 
     prompt_messages = list(messages) + [Message(role="user", content=prompt)]
-    llm_params = _resolve_llm_params(
-        model_name,
-        hf_token,
-        reasoning_effort="high",
-        custom_provider=custom_provider,
-    )
+    llm_params = _resolve_llm_params(model_name, hf_token, reasoning_effort="high")
     prompt_messages, tool_specs = with_prompt_caching(
         prompt_messages, tool_specs, llm_params.get("model")
     )
@@ -354,7 +348,6 @@ class ContextManager:
         model_name: str,
         tool_specs: list[dict] | None = None,
         hf_token: str | None = None,
-        custom_provider: dict | None = None,
     ) -> None:
         """Remove old messages to keep history under target size"""
         if not self.needs_compaction:
@@ -394,7 +387,6 @@ class ContextManager:
             max_tokens=self.compact_size,
             tool_specs=tool_specs,
             prompt=_COMPACT_PROMPT,
-            custom_provider=custom_provider,
         )
         summarized_message = Message(role="assistant", content=summary)
 

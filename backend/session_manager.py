@@ -135,7 +135,6 @@ class SessionManager:
         user_id: str = "dev",
         hf_token: str | None = None,
         model: str | None = None,
-        custom_provider: dict[str, str] | None = None,
     ) -> str:
         """Create a new agent session and return its ID.
 
@@ -149,7 +148,6 @@ class SessionManager:
             model: Optional model override. When set, replaces ``model_name``
                 on the per-session config clone. None falls back to the
                 config default.
-            custom_provider: Session-only OpenAI-compatible provider settings.
 
         Raises:
             SessionCapacityError: If the server or user has reached the
@@ -194,7 +192,7 @@ class SessionManager:
                 session_config.model_name = model
             session = Session(
                 event_queue, config=session_config, tool_router=tool_router,
-                hf_token=hf_token, custom_provider=custom_provider,
+                hf_token=hf_token,
             )
             t1 = _time.monotonic()
             logger.info(f"Session initialized in {t1 - t0:.2f}s")
@@ -271,7 +269,6 @@ class SessionManager:
                 max_tokens=4000,
                 prompt=_RESTORE_PROMPT,
                 tool_specs=tool_specs,
-                custom_provider=session.custom_provider,
             )
         except Exception as e:
             logger.error("Summary call failed during seed: %s", e)
@@ -521,15 +518,6 @@ class SessionManager:
             "user_id": agent_session.user_id,
             "pending_approval": pending_approval,
             "model": agent_session.session.config.model_name,
-            "custom_provider": (
-                {
-                    "model": agent_session.session.custom_provider.get("model"),
-                    "base_url": agent_session.session.custom_provider.get("base_url"),
-                    "label": agent_session.session.custom_provider.get("label"),
-                }
-                if agent_session.session.custom_provider
-                else None
-            ),
         }
 
     def list_sessions(self, user_id: str | None = None) -> list[dict[str, Any]]:
