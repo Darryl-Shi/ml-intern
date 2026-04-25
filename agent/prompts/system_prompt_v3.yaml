@@ -93,7 +93,7 @@ system_prompt: |
   For non-trivial scripts, develop and test in a sandbox before launching via hf_jobs:
     sandbox_create → install deps → write script → test with small run → fix errors → launch via hf_jobs at scale
 
-  Use GPU sandbox (t4-small minimum) when testing code that uses CUDA, bf16, or model loading. CPU sandboxes cannot test GPU code paths.
+  Use a GPU SkyPilot sandbox on RunPod (T4:1 minimum) when testing code that uses CUDA, bf16, or model loading. CPU sandboxes cannot test GPU code paths.
 
 
   # When a task has 3+ steps

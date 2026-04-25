@@ -12,10 +12,14 @@ a cpu-basic sandbox is auto-created (no approval needed).
 from __future__ import annotations
 
 import asyncio
+import os
+import re
+import shutil
+import subprocess
 import threading
+from copy import deepcopy
+from functools import lru_cache
 from typing import Any
-
-from huggingface_hub import HfApi, SpaceHardware
 
 from agent.core.session import Event
 from agent.tools.sandbox_client import Sandbox
@@ -81,21 +85,17 @@ async def _ensure_sandbox(
         return None, "No session available."
 
     token = session.hf_token
-    if not token:
-        return None, "No HF token available. Cannot create sandbox."
-
-    api = HfApi(token=token)
-    user_info = api.whoami()
-    owner = user_info.get("name", user_info.get("user", ""))
-    if not owner:
-        return None, "Could not determine HF username from token."
+    owner = getattr(session, "session_id", None)
 
     await session.send_event(
         Event(
             event_type="tool_log",
             data={
                 "tool": "sandbox",
-                "log": f"Auto-creating sandbox for {owner} ({hardware})...",
+                "log": (
+                    "Auto-creating SkyPilot sandbox "
+                    f"({create_kwargs.get('infra', 'runpod')}, {hardware})..."
+                ),
             },
         )
     )
@@ -124,13 +124,11 @@ async def _ensure_sandbox(
         "owner": owner,
         "hardware": hardware,
         "token": token,
-        "secrets": {"HF_TOKEN": token},
+        "secrets": {"HF_TOKEN": token} if token else {},
         "log": _log,
         "cancel_event": cancel_flag,
         **create_kwargs,
     }
-    if hardware != "cpu-basic":
-        kwargs["sleep_time"] = 2700
     import time as _t
     _t_start = _t.monotonic()
     try:
@@ -148,26 +146,91 @@ async def _ensure_sandbox(
         create_latency_s=int(_t.monotonic() - _t_start),
     )
 
-    # Set a descriptive title (template title is inherited on duplicate)
-    from huggingface_hub import metadata_update
-
-    await asyncio.to_thread(
-        metadata_update,
-        sb.space_id,
-        {"title": "ml-intern sandbox"},
-        repo_type="space",
-        overwrite=True,
-        token=token,
-    )
-
     await session.send_event(
         Event(
             event_type="tool_log",
-            data={"tool": "sandbox", "log": f"Sandbox ready: {sb.space_id} ({sb.url})"},
+            data={
+                "tool": "sandbox",
+                "log": f"SkyPilot sandbox ready: {sb.space_id} ({sb.url})",
+            },
         )
     )
 
     return sb, None
+
+
+@lru_cache(maxsize=1)
+def _skypilot_hardware_options() -> list[str]:
+    """Best-effort import of all hardware options from SkyPilot's GPU catalog."""
+    options = {"cpu-basic", "cpu-upgrade"}
+
+    env_options = os.environ.get("SKYPILOT_ACCELERATOR_OPTIONS")
+    if env_options:
+        options.update(x.strip() for x in env_options.split(",") if x.strip())
+
+    sky_bin = shutil.which("sky")
+    if sky_bin:
+        try:
+            proc = subprocess.run(
+                [sky_bin, "show-gpus", "-a"],
+                capture_output=True,
+                text=True,
+                timeout=8,
+                check=False,
+            )
+            if proc.returncode == 0:
+                options.update(_parse_sky_show_gpus(proc.stdout))
+        except Exception:
+            pass
+
+    return sorted(options)
+
+
+def _parse_sky_show_gpus(output: str) -> set[str]:
+    options: set[str] = set()
+    for raw in output.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("-") or "AVAILABLE_QUANTITIES" in line:
+            continue
+        if line.startswith(("COMMON_GPU", "GOOGLE_TPU", "OTHER_GPU")):
+            continue
+        parts = re.split(r"\s{2,}", line)
+        if not parts:
+            continue
+        name = parts[0].strip()
+        if not name or name.lower().startswith(("gpu", "tpu", "name")):
+            continue
+        options.add(name)
+        if len(parts) > 1:
+            for qty in re.findall(r"\d+(?:\.\d+)?", parts[1]):
+                options.add(f"{name}:{qty}")
+    return options
+
+
+def _hardware_schema() -> dict[str, Any]:
+    options = _skypilot_hardware_options()
+    schema: dict[str, Any] = {
+        "type": "string",
+        "description": (
+            "SkyPilot accelerator spec for the sandbox (default: cpu-basic). "
+            "Use any SkyPilot-supported value, e.g. A100:1, A100-80GB:1, "
+            "H100:1, RTX4090:1, L40S:1, T4:1. CPU aliases: cpu-basic, cpu-upgrade."
+        ),
+    }
+    if len(options) > 2:
+        schema["enum"] = options
+    return schema
+
+
+def _base_hardware_schema() -> dict[str, Any]:
+    return {
+        "type": "string",
+        "description": (
+            "SkyPilot accelerator spec for the sandbox (default: cpu-basic). "
+            "Use any SkyPilot-supported value, e.g. A100:1, A100-80GB:1, "
+            "H100:1, RTX4090:1, L40S:1, T4:1. CPU aliases: cpu-basic, cpu-upgrade."
+        ),
+    }
 
 
 # ── sandbox_create tool ──────────────────────────────────────────────
@@ -175,34 +238,35 @@ async def _ensure_sandbox(
 SANDBOX_CREATE_TOOL_SPEC = {
     "name": "sandbox_create",
     "description": (
-        "Create a persistent remote Linux environment for developing and testing scripts.\n\n"
+        "Create a persistent SkyPilot sandbox on RunPod for developing and testing scripts.\n\n"
         "Workflow: sandbox_create → write script → pip install → test with small run → fix errors → hf_jobs at scale.\n"
         "The sandbox persists across tool calls within the session. pip install works out of the box.\n\n"
         "Use this when: you need to develop, test, and iterate on scripts before launching via hf_jobs. "
         "Especially for training scripts where you need to verify imports, test on a small subset, and fix errors interactively.\n\n"
         "Skip this when: the task is a simple one-shot operation (status check, resource search, quick data query), "
         "or the script is copied from a verified working example with minimal changes.\n\n"
-        "For ML code that uses CUDA, bf16, or model loading: use GPU hardware (t4-small minimum). "
+        "For ML code that uses CUDA, bf16, or model loading: use GPU hardware (T4:1 minimum). "
         "CPU sandboxes cannot run GPU code paths — your test will not catch GPU-related errors.\n\n"
         "Before choosing hardware, estimate your VRAM needs (models you run, training data size). Rule of thumb: bf16/fp16 ≈ 2 bytes/param, "
         "fp32 ≈ 4 bytes/param, plus ~20% overhead for optimizer states during training.\n"
-        "Common picks: t4-small (16GB VRAM, fits ≤1-3B), a10g-small (24GB, ≤7B), a100-large (80GB, ≤30B). "
+        "Common picks: T4:1 (16GB VRAM, fits ≤1-3B), A10G:1 (24GB, ≤7B), A100-80GB:1 (80GB, ≤30B). "
         "If the model won't fit, pick larger hardware upfront — OOM on a sandbox wastes time.\n\n"
-        "Hardware: " + ", ".join([e.value for e in SpaceHardware]) + ".\n"
+        "Hardware uses SkyPilot accelerator specs. The default infra is RunPod.\n"
     ),
     "parameters": {
         "type": "object",
         "required": [],
         "additionalProperties": False,
         "properties": {
-            "hardware": {
+            "hardware": _base_hardware_schema(),
+            "infra": {
                 "type": "string",
-                "enum": [e.value for e in SpaceHardware],
-                "description": "Hardware tier for the sandbox (default: cpu-basic)",
+                "description": "SkyPilot infra selector for the sandbox (default: runpod).",
+                "default": "runpod",
             },
             "private": {
                 "type": "boolean",
-                "description": "If true, create a private Space",
+                "description": "Compatibility no-op; SkyPilot sandboxes are clusters, not HF Spaces.",
             },
         },
     },
@@ -223,9 +287,7 @@ async def sandbox_create_handler(
         ), True
 
     hardware = args.get("hardware", "cpu-basic")
-    create_kwargs = {}
-    if "private" in args:
-        create_kwargs["private"] = args["private"]
+    create_kwargs = {"infra": args.get("infra", "runpod")}
 
     try:
         sb, error = await _ensure_sandbox(session, hardware=hardware, **create_kwargs)
@@ -239,6 +301,7 @@ async def sandbox_create_handler(
         f"Sandbox created: {sb.space_id}\n"
         f"URL: {sb.url}\n"
         f"Hardware: {hardware}\n"
+        f"Infra: {create_kwargs['infra']}\n"
         f"Use bash/read/write/edit to interact with it."
     ), True
 
@@ -277,11 +340,13 @@ def get_sandbox_tools():
     tools = []
 
     # sandbox_create (explicit creation, requires approval)
+    sandbox_create_spec = deepcopy(SANDBOX_CREATE_TOOL_SPEC)
+    sandbox_create_spec["parameters"]["properties"]["hardware"] = _hardware_schema()
     tools.append(
         ToolSpec(
-            name=SANDBOX_CREATE_TOOL_SPEC["name"],
-            description=SANDBOX_CREATE_TOOL_SPEC["description"],
-            parameters=SANDBOX_CREATE_TOOL_SPEC["parameters"],
+            name=sandbox_create_spec["name"],
+            description=sandbox_create_spec["description"],
+            parameters=sandbox_create_spec["parameters"],
             handler=sandbox_create_handler,
         )
     )

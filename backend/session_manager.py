@@ -287,12 +287,12 @@ class SessionManager:
 
     @staticmethod
     async def _cleanup_sandbox(session: Session) -> None:
-        """Delete the sandbox Space if one was created for this session."""
+        """Delete the sandbox cluster if one was created for this session."""
         sandbox = getattr(session, "sandbox", None)
         if sandbox and getattr(sandbox, "_owns_space", False):
             space_id = getattr(sandbox, "space_id", None)
             try:
-                logger.info(f"Deleting sandbox {space_id}...")
+                logger.info(f"Deleting sandbox cluster {space_id}...")
                 await asyncio.to_thread(sandbox.delete)
                 from agent.core import telemetry
                 await telemetry.record_sandbox_destroy(session, sandbox)
@@ -452,7 +452,7 @@ class SessionManager:
         if not agent_session:
             return False
 
-        # Clean up sandbox Space before cancelling the task
+        # Clean up sandbox cluster before cancelling the task
         await self._cleanup_sandbox(agent_session.session)
 
         # Cancel the task if running

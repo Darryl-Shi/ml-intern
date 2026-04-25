@@ -398,7 +398,6 @@ async def research_handler(
                         role="tool",
                         content="Invalid tool arguments.",
                         tool_call_id=tc.id,
-                        name=tc.function.name,
                     )
                 )
                 continue
@@ -410,7 +409,6 @@ async def research_handler(
                         role="tool",
                         content=f"Tool '{tool_name}' not available for research.",
                         tool_call_id=tc.id,
-                        name=tool_name,
                     )
                 )
                 continue
@@ -437,7 +435,6 @@ async def research_handler(
                     role="tool",
                     content=output,
                     tool_call_id=tc.id,
-                    name=tool_name,
                 )
             )
 

@@ -151,6 +151,25 @@ def _is_effort_config_error(error: Exception) -> bool:
     return _is_thinking_unsupported(error) or _is_invalid_effort(error)
 
 
+def _has_tool_result(messages) -> bool:
+    for msg in messages:
+        role = getattr(msg, "role", None)
+        if role is None and isinstance(msg, dict):
+            role = msg.get("role")
+        if role == "tool":
+            return True
+    return False
+
+
+def _is_tool_result_tools_error(error: Exception) -> bool:
+    err = str(error).lower()
+    return (
+        "failed to generate response" in err
+        or "internalservererror" in err
+        or "internal server error" in err
+    )
+
+
 async def _heal_effort_and_rebuild_params(
     session: Session, error: Exception, llm_params: dict,
 ) -> dict:
@@ -300,23 +319,40 @@ async def _call_llm_streaming(session: Session, messages, tools, llm_params) -> 
     """Call the LLM with streaming, emitting assistant_chunk events."""
     response = None
     _healed_effort = False  # one-shot safety net per call
+    _dropped_tools_after_tool_result = False
+    active_tools = tools
     messages, tools = with_prompt_caching(messages, tools, llm_params.get("model"))
     t_start = time.monotonic()
     for _llm_attempt in range(_MAX_LLM_RETRIES):
         try:
-            response = await acompletion(
-                messages=messages,
-                tools=tools,
-                tool_choice="auto",
-                stream=True,
-                stream_options={"include_usage": True},
-                timeout=600,
+            kwargs = {
+                "messages": messages,
+                "stream": True,
+                "stream_options": {"include_usage": True},
+                "timeout": 600,
                 **llm_params,
-            )
+            }
+            if active_tools:
+                kwargs["tools"] = active_tools
+                kwargs["tool_choice"] = "auto"
+            response = await acompletion(**kwargs)
             break
         except ContextWindowExceededError:
             raise
         except Exception as e:
+            if (
+                active_tools
+                and _has_tool_result(messages)
+                and not _dropped_tools_after_tool_result
+                and _is_tool_result_tools_error(e)
+            ):
+                _dropped_tools_after_tool_result = True
+                active_tools = None
+                await session.send_event(Event(
+                    event_type="tool_log",
+                    data={"tool": "system", "log": "Provider rejected tools after a tool result — retrying final response without tools."},
+                ))
+                continue
             if not _healed_effort and _is_effort_config_error(e):
                 _healed_effort = True
                 llm_params = await _heal_effort_and_rebuild_params(session, e, llm_params)
@@ -408,22 +444,39 @@ async def _call_llm_non_streaming(session: Session, messages, tools, llm_params)
     """Call the LLM without streaming, emit assistant_message at the end."""
     response = None
     _healed_effort = False
+    _dropped_tools_after_tool_result = False
+    active_tools = tools
     messages, tools = with_prompt_caching(messages, tools, llm_params.get("model"))
     t_start = time.monotonic()
     for _llm_attempt in range(_MAX_LLM_RETRIES):
         try:
-            response = await acompletion(
-                messages=messages,
-                tools=tools,
-                tool_choice="auto",
-                stream=False,
-                timeout=600,
+            kwargs = {
+                "messages": messages,
+                "stream": False,
+                "timeout": 600,
                 **llm_params,
-            )
+            }
+            if active_tools:
+                kwargs["tools"] = active_tools
+                kwargs["tool_choice"] = "auto"
+            response = await acompletion(**kwargs)
             break
         except ContextWindowExceededError:
             raise
         except Exception as e:
+            if (
+                active_tools
+                and _has_tool_result(messages)
+                and not _dropped_tools_after_tool_result
+                and _is_tool_result_tools_error(e)
+            ):
+                _dropped_tools_after_tool_result = True
+                active_tools = None
+                await session.send_event(Event(
+                    event_type="tool_log",
+                    data={"tool": "system", "log": "Provider rejected tools after a tool result — retrying final response without tools."},
+                ))
+                continue
             if not _healed_effort and _is_effort_config_error(e):
                 _healed_effort = True
                 llm_params = await _heal_effort_and_rebuild_params(session, e, llm_params)
@@ -511,7 +564,6 @@ class Handlers:
                 role="tool",
                 content=abandon_msg,
                 tool_call_id=tc.id,
-                name=tool_name,
             )
             session.context_manager.add_message(tool_msg)
 
@@ -729,7 +781,6 @@ class Handlers:
                         role="tool",
                         content=error_msg,
                         tool_call_id=tc.id,
-                        name=tc.function.name,
                     ))
                     await session.send_event(Event(
                         event_type="tool_call",
@@ -832,7 +883,6 @@ class Handlers:
                             role="tool",
                             content=output,
                             tool_call_id=tc.id,
-                            name=tool_name,
                         )
                         session.context_manager.add_message(tool_msg)
 
@@ -981,7 +1031,6 @@ class Handlers:
                     role="tool",
                     content=f"Malformed arguments: {e}",
                     tool_call_id=tc.id,
-                    name=tool_name,
                 )
                 session.context_manager.add_message(tool_msg)
                 await session.send_event(
@@ -1117,7 +1166,6 @@ class Handlers:
                     role="tool",
                     content=output,
                     tool_call_id=tc.id,
-                    name=tool_name,
                 )
                 session.context_manager.add_message(tool_msg)
 
@@ -1153,7 +1201,6 @@ class Handlers:
                 role="tool",
                 content=rejection_msg,
                 tool_call_id=tc.id,
-                name=tool_name,
             )
             session.context_manager.add_message(tool_msg)
 
