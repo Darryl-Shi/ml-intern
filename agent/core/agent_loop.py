@@ -207,6 +207,7 @@ async def _heal_effort_and_rebuild_params(
         model,
         session.hf_token,
         reasoning_effort=session.effective_effort_for(model),
+        custom_provider=session.custom_provider,
     )
 
 
@@ -264,6 +265,7 @@ async def _compact_and_notify(session: Session) -> None:
         model_name=session.config.model_name,
         tool_specs=session.tool_router.get_tool_specs_for_llm(),
         hf_token=session.hf_token,
+        custom_provider=session.custom_provider,
     )
     new_usage = cm.running_context_usage
     if new_usage != old_usage:
@@ -648,6 +650,7 @@ class Handlers:
                     session.config.model_name,
                     session.hf_token,
                     reasoning_effort=session.effective_effort_for(session.config.model_name),
+                    custom_provider=session.custom_provider,
                 )
                 if session.stream:
                     llm_result = await _call_llm_streaming(session, messages, tools, llm_params)

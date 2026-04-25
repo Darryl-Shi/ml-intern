@@ -77,10 +77,12 @@ class Session:
         tool_router=None,
         context_manager: ContextManager | None = None,
         hf_token: str | None = None,
+        custom_provider: dict[str, str] | None = None,
         local_mode: bool = False,
         stream: bool = True,
     ):
         self.hf_token: Optional[str] = hf_token
+        self.custom_provider: dict[str, str] | None = custom_provider
         self.tool_router = tool_router
         self.stream = stream
         tool_specs = tool_router.get_tool_specs_for_llm() if tool_router else []
@@ -153,9 +155,14 @@ class Session:
     def is_cancelled(self) -> bool:
         return self._cancelled.is_set()
 
-    def update_model(self, model_name: str) -> None:
+    def update_model(
+        self,
+        model_name: str,
+        custom_provider: dict[str, str] | None = None,
+    ) -> None:
         """Switch the active model and update the context window limit."""
         self.config.model_name = model_name
+        self.custom_provider = custom_provider
         self.context_manager.model_max_tokens = _get_max_tokens_safe(model_name)
 
     def effective_effort_for(self, model_name: str) -> str | None:

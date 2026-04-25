@@ -89,9 +89,15 @@ def _resolve_llm_params(
     session_hf_token: str | None = None,
     reasoning_effort: str | None = None,
     strict: bool = False,
+    custom_provider: dict | None = None,
 ) -> dict:
     """
     Build LiteLLM kwargs for a given model id.
+
+    • ``custom_provider`` — session-scoped OpenAI-compatible endpoint
+      settings: ``{"model": str, "base_url": str, "api_key": str}``.
+      These are never read from config or persisted; callers pass them from
+      in-memory session state only.
 
     • ``anthropic/<model>`` — native thinking config. We bypass LiteLLM's
       ``reasoning_effort`` → ``thinking`` mapping (which lags new Claude
@@ -131,6 +137,22 @@ def _resolve_llm_params(
       2. session.hf_token — the user's own token (CLI / OAuth / cache file).
       3. HF_TOKEN env — belt-and-suspenders fallback for CLI users.
     """
+    if custom_provider:
+        params = {
+            "model": f"openai/{custom_provider['model']}",
+            "api_base": custom_provider["base_url"],
+            "api_key": custom_provider["api_key"],
+        }
+        if reasoning_effort:
+            if reasoning_effort not in _OPENAI_EFFORTS:
+                if strict:
+                    raise UnsupportedEffortError(
+                        f"OpenAI-compatible providers don't accept effort={reasoning_effort!r}"
+                    )
+            else:
+                params["reasoning_effort"] = reasoning_effort
+        return params
+
     if model_name.startswith("anthropic/"):
         params: dict = {"model": model_name}
         if reasoning_effort:

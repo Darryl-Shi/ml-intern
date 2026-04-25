@@ -21,6 +21,7 @@ from fastapi.responses import StreamingResponse
 from litellm import acompletion
 from models import (
     ApprovalRequest,
+    CustomProviderConfig,
     HealthResponse,
     LLMHealthResponse,
     SessionInfo,
@@ -67,9 +68,75 @@ AVAILABLE_MODELS = [
     },
 ]
 
+_AVAILABLE_MODEL_IDS = {m["id"] for m in AVAILABLE_MODELS}
+
 
 def _is_anthropic_model(model_id: str) -> bool:
     return "anthropic" in model_id
+
+
+def _parse_custom_provider(raw: Any) -> dict[str, str]:
+    """Validate and normalize a session-scoped custom provider config."""
+    try:
+        parsed = CustomProviderConfig.model_validate(raw)
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid custom_provider",
+        ) from e
+
+    model = parsed.model.strip()
+    base_url = parsed.base_url.strip()
+    api_key = parsed.api_key.strip()
+    label = parsed.label.strip() if parsed.label else None
+
+    if not model:
+        raise HTTPException(status_code=400, detail="custom_provider.model is required")
+    if not base_url:
+        raise HTTPException(status_code=400, detail="custom_provider.base_url is required")
+    if not base_url.startswith(("http://", "https://")):
+        raise HTTPException(
+            status_code=400,
+            detail="custom_provider.base_url must start with http:// or https://",
+        )
+    if not api_key:
+        raise HTTPException(status_code=400, detail="custom_provider.api_key is required")
+
+    out = {"model": model, "base_url": base_url, "api_key": api_key}
+    if label:
+        out["label"] = label
+    return out
+
+
+def _parse_model_selection(
+    body: dict[str, Any] | None,
+    *,
+    require_selection: bool,
+) -> tuple[str | None, dict[str, str] | None]:
+    """Return (model_id, custom_provider) for built-in or custom selection."""
+    if not isinstance(body, dict):
+        if require_selection:
+            raise HTTPException(status_code=400, detail="Missing request body")
+        return None, None
+
+    has_model = bool(body.get("model"))
+    has_custom = body.get("custom_provider") is not None
+    if has_model and has_custom:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide either 'model' or 'custom_provider', not both",
+        )
+    if has_custom:
+        custom_provider = _parse_custom_provider(body.get("custom_provider"))
+        return custom_provider["model"], custom_provider
+    if has_model:
+        model = str(body["model"]).strip()
+        if model not in _AVAILABLE_MODEL_IDS:
+            raise HTTPException(status_code=400, detail=f"Unknown model: {model}")
+        return model, None
+    if require_selection:
+        raise HTTPException(status_code=400, detail="Missing 'model' or 'custom_provider'")
+    return None, None
 
 
 async def _require_hf_for_anthropic(request: Request, model_id: str) -> None:
@@ -112,6 +179,8 @@ async def _enforce_claude_quota(
     their daily cap.
     """
     if agent_session.claude_counted:
+        return
+    if agent_session.session.custom_provider:
         return
     model_name = agent_session.session.config.model_name
     if not _is_anthropic_model(model_name):
@@ -214,6 +283,7 @@ async def get_model() -> dict:
     return {
         "current": session_manager.config.model_name,
         "available": AVAILABLE_MODELS,
+        "supports_custom_provider": True,
     }
 
 
@@ -300,27 +370,27 @@ async def create_session(
     if not hf_token:
         hf_token = os.environ.get("HF_TOKEN")
 
-    # Optional model override. Empty body falls back to the config default.
+    # Optional model/custom provider override. Empty body falls back to the config default.
     model: str | None = None
+    custom_provider: dict[str, str] | None = None
     try:
         body = await request.json()
     except Exception:
         body = None
-    if isinstance(body, dict):
-        model = body.get("model")
-
-    valid_ids = {m["id"] for m in AVAILABLE_MODELS}
-    if model and model not in valid_ids:
-        raise HTTPException(status_code=400, detail=f"Unknown model: {model}")
+    model, custom_provider = _parse_model_selection(body, require_selection=False)
 
     # Opus is gated to HF staff (PR #63). Only fires when the resolved model
     # is Anthropic; free models pass through.
     resolved_model = model or session_manager.config.model_name
-    await _require_hf_for_anthropic(request, resolved_model)
+    if custom_provider is None:
+        await _require_hf_for_anthropic(request, resolved_model)
 
     try:
         session_id = await session_manager.create_session(
-            user_id=user["user_id"], hf_token=hf_token, model=model
+            user_id=user["user_id"],
+            hf_token=hf_token,
+            model=model,
+            custom_provider=custom_provider,
         )
     except SessionCapacityError as e:
         raise HTTPException(status_code=503, detail=str(e))
@@ -353,17 +423,18 @@ async def restore_session_summary(
     if not hf_token:
         hf_token = os.environ.get("HF_TOKEN")
 
-    model = body.get("model")
-    valid_ids = {m["id"] for m in AVAILABLE_MODELS}
-    if model and model not in valid_ids:
-        raise HTTPException(status_code=400, detail=f"Unknown model: {model}")
+    model, custom_provider = _parse_model_selection(body, require_selection=False)
 
     resolved_model = model or session_manager.config.model_name
-    await _require_hf_for_anthropic(request, resolved_model)
+    if custom_provider is None:
+        await _require_hf_for_anthropic(request, resolved_model)
 
     try:
         session_id = await session_manager.create_session(
-            user_id=user["user_id"], hf_token=hf_token, model=model
+            user_id=user["user_id"],
+            hf_token=hf_token,
+            model=model,
+            custom_provider=custom_provider,
         )
     except SessionCapacityError as e:
         raise HTTPException(status_code=503, detail=str(e))
@@ -410,22 +481,31 @@ async def set_session_model(
     free-model switches are unrestricted.
     """
     _check_session_access(session_id, user)
-    model_id = body.get("model")
-    if not model_id:
-        raise HTTPException(status_code=400, detail="Missing 'model' field")
-    valid_ids = {m["id"] for m in AVAILABLE_MODELS}
-    if model_id not in valid_ids:
-        raise HTTPException(status_code=400, detail=f"Unknown model: {model_id}")
-    await _require_hf_for_anthropic(request, model_id)
+    model_id, custom_provider = _parse_model_selection(body, require_selection=True)
+    assert model_id is not None
+    if custom_provider is None:
+        await _require_hf_for_anthropic(request, model_id)
     agent_session = session_manager.sessions.get(session_id)
     if not agent_session:
         raise HTTPException(status_code=404, detail="Session not found")
-    agent_session.session.update_model(model_id)
+    agent_session.session.update_model(model_id, custom_provider=custom_provider)
     logger.info(
         f"Session {session_id} model → {model_id} "
-        f"(by {user.get('username', 'unknown')})"
+        f"(custom={custom_provider is not None}, by {user.get('username', 'unknown')})"
     )
-    return {"session_id": session_id, "model": model_id}
+    return {
+        "session_id": session_id,
+        "model": model_id,
+        "custom_provider": (
+            {
+                "model": custom_provider.get("model"),
+                "base_url": custom_provider.get("base_url"),
+                "label": custom_provider.get("label"),
+            }
+            if custom_provider
+            else None
+        ),
+    }
 
 
 @router.get("/user/quota")
@@ -729,5 +809,3 @@ async def submit_feedback(
             agent_session.session.config.session_dataset_repo
         )
     return {"status": "ok"}
-
-

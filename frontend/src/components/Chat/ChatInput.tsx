@@ -1,8 +1,28 @@
 import { useState, useCallback, useEffect, useRef, KeyboardEvent } from 'react';
-import { Box, TextField, IconButton, CircularProgress, Typography, Menu, MenuItem, ListItemIcon, ListItemText, Chip } from '@mui/material';
+import {
+  Box,
+  TextField,
+  IconButton,
+  CircularProgress,
+  Typography,
+  Menu,
+  MenuItem,
+  ListItemIcon,
+  ListItemText,
+  Chip,
+  Dialog,
+  DialogTitle,
+  DialogContent,
+  DialogActions,
+  Button,
+  Alert,
+  Divider,
+} from '@mui/material';
 import ArrowUpwardIcon from '@mui/icons-material/ArrowUpward';
 import ArrowDropDownIcon from '@mui/icons-material/ArrowDropDown';
 import StopIcon from '@mui/icons-material/Stop';
+import AddCircleOutlineIcon from '@mui/icons-material/AddCircleOutline';
+import HubOutlinedIcon from '@mui/icons-material/HubOutlined';
 import { apiFetch } from '@/utils/api';
 import { useUserQuota } from '@/hooks/useUserQuota';
 import ClaudeCapDialog from '@/components/ClaudeCapDialog';
@@ -17,6 +37,12 @@ interface ModelOption {
   modelPath: string;
   avatarUrl: string;
   recommended?: boolean;
+}
+
+interface CustomProviderInfo {
+  model: string;
+  base_url: string;
+  label?: string | null;
 }
 
 const getHfAvatarUrl = (modelId: string) => {
@@ -58,7 +84,7 @@ const MODEL_OPTIONS: ModelOption[] = [
 ];
 
 const findModelByPath = (path: string): ModelOption | undefined => {
-  return MODEL_OPTIONS.find(m => m.modelPath === path || path?.includes(m.id));
+  return MODEL_OPTIONS.find(m => m.modelPath === path);
 };
 
 interface ChatInputProps {
@@ -77,7 +103,15 @@ export default function ChatInput({ sessionId, onSend, onStop, isProcessing = fa
   const [input, setInput] = useState('');
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const [selectedModelId, setSelectedModelId] = useState<string>(MODEL_OPTIONS[0].id);
+  const [customProvider, setCustomProvider] = useState<CustomProviderInfo | null>(null);
   const [modelAnchorEl, setModelAnchorEl] = useState<null | HTMLElement>(null);
+  const [customDialogOpen, setCustomDialogOpen] = useState(false);
+  const [customLabel, setCustomLabel] = useState('');
+  const [customModel, setCustomModel] = useState('');
+  const [customBaseUrl, setCustomBaseUrl] = useState('');
+  const [customApiKey, setCustomApiKey] = useState('');
+  const [customError, setCustomError] = useState<string | null>(null);
+  const [customSaving, setCustomSaving] = useState(false);
   const { quota, refresh: refreshQuota } = useUserQuota();
   // The daily-cap dialog is triggered from two places: (a) a 429 returned
   // from the chat transport when the user tries to send on Opus over cap —
@@ -98,8 +132,16 @@ export default function ChatInput({ sessionId, onSend, onStop, isProcessing = fa
       .then((data) => {
         if (cancelled) return;
         if (data?.model) {
-          const model = findModelByPath(data.model);
-          if (model) setSelectedModelId(model.id);
+          if (data.custom_provider) {
+            setCustomProvider(data.custom_provider);
+            setSelectedModelId('custom');
+          } else {
+            const model = findModelByPath(data.model);
+            if (model) {
+              setSelectedModelId(model.id);
+              setCustomProvider(null);
+            }
+          }
         }
       })
       .catch(() => { /* ignore */ });
@@ -107,6 +149,19 @@ export default function ChatInput({ sessionId, onSend, onStop, isProcessing = fa
   }, [sessionId]);
 
   const selectedModel = MODEL_OPTIONS.find(m => m.id === selectedModelId) || MODEL_OPTIONS[0];
+  const selectedDisplay = customProvider
+    ? {
+        name: customProvider.label || customProvider.model,
+        description: customProvider.base_url,
+        avatarUrl: '',
+        isCustom: true,
+      }
+    : {
+        name: selectedModel.name,
+        description: selectedModel.description,
+        avatarUrl: selectedModel.avatarUrl,
+        isCustom: false,
+      };
 
   // Auto-focus the textarea when the session becomes ready
   useEffect(() => {
@@ -156,6 +211,23 @@ export default function ChatInput({ sessionId, onSend, onStop, isProcessing = fa
     setModelAnchorEl(null);
   };
 
+  const openCustomDialog = () => {
+    handleModelClose();
+    setCustomLabel(customProvider?.label || '');
+    setCustomModel(customProvider?.model || '');
+    setCustomBaseUrl(customProvider?.base_url || '');
+    setCustomApiKey('');
+    setCustomError(null);
+    setCustomDialogOpen(true);
+  };
+
+  const closeCustomDialog = () => {
+    if (customSaving) return;
+    setCustomDialogOpen(false);
+    setCustomApiKey('');
+    setCustomError(null);
+  };
+
   const handleSelectModel = async (model: ModelOption) => {
     handleModelClose();
     if (!sessionId) return;
@@ -164,8 +236,51 @@ export default function ChatInput({ sessionId, onSend, onStop, isProcessing = fa
         method: 'POST',
         body: JSON.stringify({ model: model.modelPath }),
       });
-      if (res.ok) setSelectedModelId(model.id);
+      if (res.ok) {
+        setSelectedModelId(model.id);
+        setCustomProvider(null);
+      }
     } catch { /* ignore */ }
+  };
+
+  const handleSaveCustomProvider = async () => {
+    if (!sessionId || customSaving) return;
+    const model = customModel.trim();
+    const baseUrl = customBaseUrl.trim();
+    const apiKey = customApiKey.trim();
+    const label = customLabel.trim();
+    if (!model || !baseUrl || !apiKey) {
+      setCustomError('Model, base URL, and API key are required.');
+      return;
+    }
+    setCustomSaving(true);
+    setCustomError(null);
+    try {
+      const res = await apiFetch(`/api/session/${sessionId}/model`, {
+        method: 'POST',
+        body: JSON.stringify({
+          custom_provider: {
+            model,
+            base_url: baseUrl,
+            api_key: apiKey,
+            ...(label ? { label } : {}),
+          },
+        }),
+      });
+      if (!res.ok) {
+        const detail = await res.text().catch(() => '');
+        throw new Error(detail || `Request failed (${res.status})`);
+      }
+      const data = await res.json();
+      setCustomProvider(data.custom_provider || { model, base_url: baseUrl, label: label || null });
+      setSelectedModelId('custom');
+      setCustomDialogOpen(false);
+      setCustomApiKey('');
+    } catch (e) {
+      setCustomError(e instanceof Error ? e.message : 'Failed to save custom provider.');
+    } finally {
+      setCustomSaving(false);
+    }
   };
 
   // Dialog close: just clear the flag. The typed text is already restored.
@@ -187,6 +302,7 @@ export default function ChatInput({ sessionId, onSend, onStop, isProcessing = fa
       });
       if (res.ok) {
         setSelectedModelId(free.id);
+        setCustomProvider(null);
         const retryText = lastSentRef.current;
         if (retryText) {
           onSend(retryText);
@@ -334,13 +450,17 @@ export default function ChatInput({ sessionId, onSend, onStop, isProcessing = fa
           <Typography variant="caption" sx={{ fontSize: '10px', color: 'var(--muted-text)', textTransform: 'uppercase', letterSpacing: '0.05em', fontWeight: 500 }}>
             powered by
           </Typography>
-          <img
-            src={selectedModel.avatarUrl}
-            alt={selectedModel.name}
-            style={{ height: '14px', width: '14px', objectFit: 'contain', borderRadius: '2px' }}
-          />
+          {selectedDisplay.isCustom ? (
+            <HubOutlinedIcon sx={{ fontSize: 14, color: 'var(--muted-text)' }} />
+          ) : (
+            <img
+              src={selectedDisplay.avatarUrl}
+              alt={selectedDisplay.name}
+              style={{ height: '14px', width: '14px', objectFit: 'contain', borderRadius: '2px' }}
+            />
+          )}
           <Typography variant="caption" sx={{ fontSize: '10px', color: 'var(--text)', fontWeight: 600, letterSpacing: '0.02em' }}>
-            {selectedModel.name}
+            {selectedDisplay.name}
           </Typography>
           <ArrowDropDownIcon sx={{ fontSize: '14px', color: 'var(--muted-text)' }} />
         </Box>
@@ -427,7 +547,121 @@ export default function ChatInput({ sessionId, onSend, onStop, isProcessing = fa
               />
             </MenuItem>
           ))}
+          <Divider sx={{ borderColor: 'var(--divider)' }} />
+          <MenuItem
+            onClick={openCustomDialog}
+            selected={selectedModelId === 'custom'}
+            sx={{
+              py: 1.5,
+              '&.Mui-selected': {
+                bgcolor: 'rgba(255,255,255,0.05)',
+              }
+            }}
+          >
+            <ListItemIcon>
+              <AddCircleOutlineIcon sx={{ color: 'var(--muted-text)' }} />
+            </ListItemIcon>
+            <ListItemText
+              primary={
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                  Custom provider
+                  {customProvider && (
+                    <Chip
+                      label="Active"
+                      size="small"
+                      sx={{
+                        height: '18px',
+                        fontSize: '10px',
+                        bgcolor: 'rgba(255,255,255,0.08)',
+                        color: 'var(--muted-text)',
+                        fontWeight: 600,
+                      }}
+                    />
+                  )}
+                </Box>
+              }
+              secondary={customProvider?.model || 'OpenAI-compatible endpoint'}
+              secondaryTypographyProps={{
+                sx: { fontSize: '12px', color: 'var(--muted-text)' }
+              }}
+            />
+          </MenuItem>
         </Menu>
+
+        <Dialog
+          open={customDialogOpen}
+          onClose={closeCustomDialog}
+          fullWidth
+          maxWidth="sm"
+          PaperProps={{
+            sx: {
+              bgcolor: 'var(--panel)',
+              border: '1px solid var(--divider)',
+            },
+          }}
+        >
+          <DialogTitle sx={{ fontSize: '1rem', fontWeight: 700 }}>
+            Custom provider
+          </DialogTitle>
+          <DialogContent sx={{ display: 'grid', gap: 1.5, pt: '8px !important' }}>
+            {customError && (
+              <Alert severity="error" sx={{ fontSize: '0.78rem' }}>
+                {customError}
+              </Alert>
+            )}
+            <TextField
+              label="Label"
+              value={customLabel}
+              onChange={(e) => setCustomLabel(e.target.value)}
+              placeholder="Local vLLM"
+              size="small"
+              fullWidth
+            />
+            <TextField
+              label="Model"
+              value={customModel}
+              onChange={(e) => setCustomModel(e.target.value)}
+              placeholder="meta-llama/Llama-3.1-8B-Instruct"
+              size="small"
+              required
+              fullWidth
+            />
+            <TextField
+              label="Base URL"
+              value={customBaseUrl}
+              onChange={(e) => setCustomBaseUrl(e.target.value)}
+              placeholder="https://api.example.com/v1"
+              size="small"
+              required
+              fullWidth
+            />
+            <TextField
+              label="API key"
+              value={customApiKey}
+              onChange={(e) => setCustomApiKey(e.target.value)}
+              type="password"
+              size="small"
+              required
+              fullWidth
+            />
+            <Typography variant="caption" sx={{ color: 'var(--muted-text)' }}>
+              The key is kept only for this backend session and is never saved in your browser.
+            </Typography>
+          </DialogContent>
+          <DialogActions sx={{ px: 3, pb: 2 }}>
+            <Button onClick={closeCustomDialog} disabled={customSaving} sx={{ textTransform: 'none' }}>
+              Cancel
+            </Button>
+            <Button
+              onClick={handleSaveCustomProvider}
+              disabled={customSaving}
+              variant="contained"
+              sx={{ textTransform: 'none' }}
+            >
+              {customSaving ? 'Saving...' : 'Use provider'}
+            </Button>
+          </DialogActions>
+        </Dialog>
 
         <ClaudeCapDialog
           open={claudeQuotaExhausted}

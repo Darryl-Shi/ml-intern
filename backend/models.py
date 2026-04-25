@@ -54,6 +54,23 @@ class SubmitRequest(BaseModel):
     text: str
 
 
+class CustomProviderConfig(BaseModel):
+    """Session-scoped OpenAI-compatible provider settings."""
+
+    model: str
+    base_url: str
+    api_key: str
+    label: str | None = None
+
+
+class CustomProviderInfo(BaseModel):
+    """Non-secret custom provider metadata safe to return to clients."""
+
+    model: str
+    base_url: str
+    label: str | None = None
+
+
 class TruncateRequest(BaseModel):
     """Request to truncate conversation history to before a specific user message."""
 
@@ -86,6 +103,7 @@ class SessionInfo(BaseModel):
     user_id: str = "dev"
     pending_approval: list[PendingApprovalTool] | None = None
     model: str | None = None
+    custom_provider: CustomProviderInfo | None = None
 
 
 class HealthResponse(BaseModel):
