@@ -153,6 +153,26 @@ class _FakeSandbox:
 
 
 @pytest.mark.asyncio
+async def test_sandbox_create_exposes_runpod_gpu_options_only():
+    mcp = await create_mcp_server(load_dynamic_api_schema=False)
+    tools = {tool.name: tool for tool in await mcp.list_tools()}
+
+    schema = tools["sandbox_create"].parameters
+    properties = schema["properties"]
+    hardware = properties["hardware"]
+
+    assert "infra" not in properties
+    assert "cpu-basic" not in hardware["enum"]
+    assert "cpu-upgrade" not in hardware["enum"]
+    assert "RTX4090:1" in hardware["enum"]
+    assert "RTX4090:2" in hardware["enum"]
+    assert "L40S:1" in hardware["enum"]
+    assert "L40S:4" in hardware["enum"]
+    assert "A100-80GB:1" in hardware["enum"]
+    assert "RunPod GPU accelerator" in hardware["description"]
+
+
+@pytest.mark.asyncio
 async def test_all_mcp_tools_are_callable_with_safe_mocks(monkeypatch):
     calls = []
 
@@ -191,7 +211,7 @@ async def test_all_mcp_tools_are_callable_with_safe_mocks(monkeypatch):
 
     fake_sandbox = _FakeSandbox()
 
-    async def fake_ensure_sandbox(session, hardware="cpu-basic", **kwargs):
+    async def fake_ensure_sandbox(session, hardware="RTX4090:1", **kwargs):
         session.sandbox = fake_sandbox
         return fake_sandbox, None
 
@@ -270,7 +290,7 @@ async def test_all_mcp_tools_are_callable_with_safe_mocks(monkeypatch):
 async def test_mcp_sandbox_requires_create_and_persists(monkeypatch):
     fake = _FakeSandbox()
 
-    async def fake_ensure_sandbox(session, hardware="cpu-basic", **kwargs):
+    async def fake_ensure_sandbox(session, hardware="RTX4090:1", **kwargs):
         session.sandbox = fake
         return fake, None
 

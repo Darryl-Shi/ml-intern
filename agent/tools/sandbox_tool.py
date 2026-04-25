@@ -2,20 +2,14 @@
 Sandbox tools — expose the Sandbox client as agent tools.
 
 5 tools total:
-  sandbox_create — explicit sandbox creation (requires approval)
+  sandbox_create — explicit RunPod sandbox creation (requires approval)
   bash, read, write, edit — operations on the sandbox
-
-If any operation tool is called without an active sandbox,
-a cpu-basic sandbox is auto-created (no approval needed).
 """
 
 from __future__ import annotations
 
 import asyncio
 import os
-import re
-import shutil
-import subprocess
 import threading
 from copy import deepcopy
 from functools import lru_cache
@@ -70,7 +64,7 @@ async def resolve_sandbox_script(
 
 
 async def _ensure_sandbox(
-    session: Any, hardware: str = "cpu-basic", **create_kwargs
+    session: Any, hardware: str = "RTX4090:1", **create_kwargs
 ) -> tuple[Sandbox | None, str | None]:
     """
     Ensure a sandbox exists on the session. Auto-creates with given hardware if needed.
@@ -166,75 +160,65 @@ async def _ensure_sandbox(
 
 
 @lru_cache(maxsize=1)
-def _skypilot_hardware_options() -> list[str]:
-    """Best-effort import of all hardware options from SkyPilot's GPU catalog."""
-    options = {"cpu-basic", "cpu-upgrade"}
+def _runpod_hardware_options() -> list[str]:
+    """RunPod GPU options in SkyPilot accelerator syntax.
 
-    env_options = os.environ.get("SKYPILOT_ACCELERATOR_OPTIONS")
+    Keep this list RunPod-specific. Do not scrape ``sky show-gpus -a`` here:
+    that command returns SkyPilot's global accelerator catalog across clouds,
+    which leaks irrelevant infrastructure choices into the MCP schema.
+    """
+    gpu_families = {
+        "RTX3070",
+        "RTX3080",
+        "RTX3090",
+        "RTX4000",
+        "RTX4000Ada",
+        "RTX4090",
+        "RTX5000Ada",
+        "RTX5090",
+        "RTX6000Ada",
+        "A30",
+        "A40",
+        "A100",
+        "A100-80GB",
+        "B200",
+        "H100",
+        "H100-80GB",
+        "H200",
+        "L4",
+        "L40",
+        "L40S",
+        "V100",
+    }
+    options = {f"{gpu}:{count}" for gpu in gpu_families for count in (1, 2, 4, 8)}
+
+    env_options = os.environ.get("RUNPOD_ACCELERATOR_OPTIONS")
     if env_options:
         options.update(x.strip() for x in env_options.split(",") if x.strip())
-
-    sky_bin = shutil.which("sky")
-    if sky_bin:
-        try:
-            proc = subprocess.run(
-                [sky_bin, "show-gpus", "-a"],
-                capture_output=True,
-                text=True,
-                timeout=8,
-                check=False,
-            )
-            if proc.returncode == 0:
-                options.update(_parse_sky_show_gpus(proc.stdout))
-        except Exception:
-            pass
 
     return sorted(options)
 
 
-def _parse_sky_show_gpus(output: str) -> set[str]:
-    options: set[str] = set()
-    for raw in output.splitlines():
-        line = raw.strip()
-        if not line or line.startswith("-") or "AVAILABLE_QUANTITIES" in line:
-            continue
-        if line.startswith(("COMMON_GPU", "GOOGLE_TPU", "OTHER_GPU")):
-            continue
-        parts = re.split(r"\s{2,}", line)
-        if not parts:
-            continue
-        name = parts[0].strip()
-        if not name or name.lower().startswith(("gpu", "tpu", "name")):
-            continue
-        options.add(name)
-        if len(parts) > 1:
-            for qty in re.findall(r"\d+(?:\.\d+)?", parts[1]):
-                options.add(f"{name}:{qty}")
-    return options
-
-
 def _hardware_schema() -> dict[str, Any]:
-    options = _skypilot_hardware_options()
-    schema: dict[str, Any] = {
+    options = _runpod_hardware_options()
+    return {
         "type": "string",
         "description": (
-            "SkyPilot accelerator spec for the sandbox (default: cpu-basic). "
-            "Use any SkyPilot-supported value, e.g. A100:1, A100-80GB:1, "
-            "H100:1, RTX4090:1, L40S:1, T4:1. CPU aliases: cpu-basic, cpu-upgrade."
+            "RunPod GPU accelerator in SkyPilot syntax (default: RTX4090:1). "
+            "Use RunPod GPU families such as RTX4090:1, L40S:1, A40:1, "
+            "A100-80GB:1, H100:1, H200:1. For multiple GPUs, change the suffix "
+            "where supported, e.g. L40S:2 or A100-80GB:4."
         ),
+        "enum": options,
     }
-    if len(options) > 2:
-        schema["enum"] = options
-    return schema
 
 
 def _base_hardware_schema() -> dict[str, Any]:
     return {
         "type": "string",
         "description": (
-            "SkyPilot accelerator spec for the sandbox (default: cpu-basic). "
-            "Use any SkyPilot-supported value, e.g. A100:1, A100-80GB:1, "
-            "H100:1, RTX4090:1, L40S:1, T4:1. CPU aliases: cpu-basic, cpu-upgrade."
+            "RunPod GPU accelerator in SkyPilot syntax (default: RTX4090:1). "
+            "Examples: RTX4090:1, L40S:1, A40:1, A100-80GB:1, H100:1, H200:1."
         ),
     }
 
@@ -251,13 +235,13 @@ SANDBOX_CREATE_TOOL_SPEC = {
         "Especially for training scripts where you need to verify imports, test on a small subset, and fix errors interactively.\n\n"
         "Skip this when: the task is a simple one-shot operation (status check, resource search, quick data query), "
         "or the script is copied from a verified working example with minimal changes.\n\n"
-        "For ML code that uses CUDA, bf16, or model loading: use GPU hardware (T4:1 minimum). "
-        "CPU sandboxes cannot run GPU code paths — your test will not catch GPU-related errors.\n\n"
+        "RunPod sandboxes are GPU-oriented. For ML code that uses CUDA, bf16, "
+        "or model loading, choose a GPU with enough VRAM.\n\n"
         "Before choosing hardware, estimate your VRAM needs (models you run, training data size). Rule of thumb: bf16/fp16 ≈ 2 bytes/param, "
         "fp32 ≈ 4 bytes/param, plus ~20% overhead for optimizer states during training.\n"
-        "Common picks: T4:1 (16GB VRAM, fits ≤1-3B), A10G:1 (24GB, ≤7B), A100-80GB:1 (80GB, ≤30B). "
+        "Common RunPod picks: RTX4090:1 (24GB VRAM, small models/prototyping), L40S:1 (48GB, medium workloads), A100-80GB:1 or H100:1 (80GB, larger training/inference). "
         "If the model won't fit, pick larger hardware upfront — OOM on a sandbox wastes time.\n\n"
-        "Hardware uses SkyPilot accelerator specs. The default infra is RunPod.\n"
+        "Hardware uses SkyPilot accelerator syntax for RunPod GPUs. The infra is fixed to RunPod.\n"
     ),
     "parameters": {
         "type": "object",
@@ -265,14 +249,9 @@ SANDBOX_CREATE_TOOL_SPEC = {
         "additionalProperties": False,
         "properties": {
             "hardware": _base_hardware_schema(),
-            "infra": {
-                "type": "string",
-                "description": "SkyPilot infra selector for the sandbox (default: runpod).",
-                "default": "runpod",
-            },
             "private": {
                 "type": "boolean",
-                "description": "Compatibility no-op; SkyPilot sandboxes are clusters, not HF Spaces.",
+                "description": "Compatibility no-op; RunPod sandboxes are clusters, not HF Spaces.",
             },
         },
     },
@@ -292,8 +271,8 @@ async def sandbox_create_handler(
             f"Use bash/read/write/edit to interact with it."
         ), True
 
-    hardware = args.get("hardware", "cpu-basic")
-    create_kwargs = {"infra": args.get("infra", "runpod")}
+    hardware = args.get("hardware", "RTX4090:1")
+    create_kwargs = {"infra": "runpod"}
 
     try:
         sb, error = await _ensure_sandbox(session, hardware=hardware, **create_kwargs)
