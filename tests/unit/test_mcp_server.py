@@ -6,6 +6,8 @@ import pytest
 from fastmcp import Client
 
 import agent.mcp_server as mcp_server_mod
+from agent.tools.sandbox_client import _repair_empty_skypilot_catalogs
+from agent.tools.sandbox_tool import sandbox_create_handler
 from agent.mcp_types import ToolSpec
 from agent.mcp_server import MCPSessionState, _tool_from_spec, create_mcp_server
 
@@ -170,6 +172,43 @@ async def test_sandbox_create_exposes_runpod_gpu_options_only():
     assert "L40S:4" in hardware["enum"]
     assert "A100-80GB:1" in hardware["enum"]
     assert "RunPod GPU accelerator" in hardware["description"]
+
+
+def test_repair_empty_skypilot_catalogs_removes_zero_byte_csvs(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    catalog_dir = tmp_path / ".sky" / "catalogs" / "v8" / "common"
+    catalog_dir.mkdir(parents=True)
+    empty_catalog = catalog_dir / "accelerators.csv"
+    populated_catalog = catalog_dir / "metadata.csv"
+    empty_catalog.write_text("")
+    populated_catalog.write_text("GPU,MemoryGB\nL40S,48\n")
+    logs = []
+
+    _repair_empty_skypilot_catalogs(logs.append)
+
+    assert not empty_catalog.exists()
+    assert populated_catalog.exists()
+    assert "accelerators.csv" in logs[0]
+
+
+@pytest.mark.asyncio
+async def test_sandbox_create_adds_restart_hint_for_launch_500(monkeypatch):
+    async def fake_ensure_sandbox(*args, **kwargs):
+        raise RuntimeError(
+            "500 Server Error: Internal Server Error for url: "
+            "http://127.0.0.1:46580/launch"
+        )
+
+    monkeypatch.setattr(
+        "agent.tools.sandbox_tool._ensure_sandbox",
+        fake_ensure_sandbox,
+    )
+
+    output, success = await sandbox_create_handler({}, session=MCPSessionState())
+
+    assert success is False
+    assert "uv run sky api stop" in output
+    assert "~/.sky/api_server/server.log" in output
 
 
 @pytest.mark.asyncio

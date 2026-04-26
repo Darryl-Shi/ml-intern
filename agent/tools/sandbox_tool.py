@@ -277,7 +277,7 @@ async def sandbox_create_handler(
     try:
         sb, error = await _ensure_sandbox(session, hardware=hardware, **create_kwargs)
     except Exception as e:
-        return f"Failed to create sandbox: {e}", False
+        return f"Failed to create sandbox: {_format_create_error(e)}", False
 
     if error:
         return error, False
@@ -289,6 +289,20 @@ async def sandbox_create_handler(
         f"Infra: {create_kwargs['infra']}\n"
         f"Use bash/read/write/edit to interact with it."
     ), True
+
+
+def _format_create_error(error: Exception) -> str:
+    message = str(error)
+    if "500 Server Error" in message and "/launch" in message:
+        return (
+            f"{message}\n\n"
+            "SkyPilot's local API server returned an internal error while "
+            "handling the launch request. Try restarting it with "
+            "`uv run sky api stop` followed by `uv run sky api start`, then "
+            "call sandbox_create again. Server logs are in "
+            "`~/.sky/api_server/server.log`."
+        )
+    return message
 
 
 def _make_tool_handler(sandbox_tool_name: str):

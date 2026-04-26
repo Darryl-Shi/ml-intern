@@ -22,6 +22,7 @@ import contextlib
 import io
 import json
 import os
+import pathlib
 import re
 import shlex
 import sys
@@ -70,6 +71,26 @@ def _require_sky():
             "`uv sync` or `uv pip install 'skypilot-nightly[runpod]'`."
         ) from e
     return sky
+
+
+def _repair_empty_skypilot_catalogs(log: Callable[[str], object] | None = None) -> None:
+    """Delete empty SkyPilot catalog CSV caches so SkyPilot can refetch them."""
+    catalog_root = pathlib.Path.home() / ".sky" / "catalogs"
+    if not catalog_root.exists():
+        return
+
+    repaired = []
+    for path in catalog_root.glob("*/*/*.csv"):
+        try:
+            if path.is_file() and path.stat().st_size == 0:
+                path.unlink()
+                repaired.append(path)
+        except OSError:
+            continue
+
+    if repaired and log is not None:
+        paths = ", ".join(str(path) for path in repaired)
+        log(f"Removed empty SkyPilot catalog cache file(s): {paths}")
 
 
 def _wait_for_request(sky: Any, request_id: Any, *, stream: bool = True) -> tuple[Any, str]:
@@ -362,6 +383,7 @@ class Sandbox:
         """Create a SkyPilot cluster and prepare it as a sandbox."""
         del wait_timeout  # SkyPilot owns provisioning timeouts/retries.
         _log = log or print
+        _repair_empty_skypilot_catalogs(_log)
         sky = _require_sky()
 
         def _check_cancel() -> None:
