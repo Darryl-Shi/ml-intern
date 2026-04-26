@@ -2,7 +2,7 @@
 
 This server is meant to be used from agentic CLIs that already provide local
 shell and filesystem tools. It exposes ML/Hugging Face research tools plus a
-remote SkyPilot sandbox, and deliberately does not expose local bash/read/write.
+remote RunPod sandbox, and deliberately does not expose local bash/read/write.
 """
 
 from __future__ import annotations
@@ -251,7 +251,7 @@ def _sandbox_tool_specs() -> list[ToolSpec]:
                 ToolSpec(
                     name=spec.name,
                     description=(
-                        "Create a remote SkyPilot sandbox. Required before using "
+                        "Create a remote RunPod sandbox. Required before using "
                         "sandbox_bash, sandbox_read, sandbox_write, or sandbox_edit.\n\n"
                         + spec.description
                     ),
@@ -282,7 +282,7 @@ async def create_mcp_server(
     mcp = FastMCP(
         "ML Intern",
         instructions=(
-            "Specialist ML/Hugging Face tools and remote SkyPilot sandboxes. "
+            "Specialist ML/Hugging Face tools and remote RunPod sandboxes. "
             "Use the host CLI for local shell and filesystem operations."
         ),
         version="0.1.0",

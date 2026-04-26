@@ -2,7 +2,7 @@
 
 ML Intern is now a specialist MCP server for agentic CLIs. It exposes
 Hugging Face research, documentation, dataset, repository, GitHub example, and
-remote SkyPilot sandbox tools over stdio.
+remote RunPod sandbox tools over stdio.
 
 The host CLI remains responsible for normal local shell and filesystem access.
 This server deliberately does not expose local `bash`, `read`, `write`, or
@@ -60,8 +60,8 @@ export GITHUB_TOKEN=...
 export S2_API_KEY=...
 ```
 
-SkyPilot sandbox tools also use your existing SkyPilot and RunPod environment
-configuration.
+RunPod sandbox tools use your RunPod environment configuration
+(RUNPOD_API_KEY).
 
 ## MCP Config
 

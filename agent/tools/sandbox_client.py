@@ -1,34 +1,31 @@
 #!/usr/bin/env python3
 """
-Sandbox Tools - Agent-native primitives for SkyPilot sandboxes.
+Sandbox Tools - RunPod sandbox provider.
 
-The public class intentionally keeps the previous sandbox shape so the rest of
-the agent can swap backends without a large migration:
-
-    sb = Sandbox.create(hardware="A100:1", infra="runpod")
+    sb = Sandbox.create(hardware="A100:1")
     sb.bash("python train.py")
     sb.read("/app/train.py")
     sb.edit("/app/train.py", old_str="lr=1e-3", new_str="lr=1e-4")
     sb.delete()
-
-SkyPilot calls are synchronous from this wrapper's point of view. Current
-SkyPilot SDK methods return request IDs, so we stream-and-wait before returning.
 """
 
 from __future__ import annotations
 
 import base64
-import contextlib
 import io
 import json
 import os
 import pathlib
 import re
 import shlex
+import subprocess
 import sys
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable
+
+import httpx
 
 OUTPUT_LIMIT = 25000
 DEFAULT_READ_LIMIT = 2000
@@ -41,6 +38,9 @@ CPU_ALIASES = {
     "cpu-basic": {"cpus": "2+", "memory": "8+"},
     "cpu-upgrade": {"cpus": "8+", "memory": "32+"},
 }
+
+RUNPOD_API_BASE = "https://rest.runpod.io/v1"
+_SSH_KEY_NAME = "runpod_ml_intern"
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]|\x1b\].*?\x07")
 
@@ -62,76 +62,176 @@ def _truncate_output(output: str, max_chars: int = OUTPUT_LIMIT, head_ratio: flo
     return output[:head_budget] + meta + output[-tail_budget:]
 
 
-def _require_sky():
-    try:
-        import sky  # type: ignore
-    except Exception as e:
+# ── RunPod API helpers ────────────────────────────────────────────────
+
+
+def _get_runpod_api_key() -> str:
+    key = os.environ.get("RUNPOD_API_KEY")
+    if not key:
         raise RuntimeError(
-            "SkyPilot is not available. Install dependencies with "
-            "`uv sync` or `uv pip install 'skypilot-nightly[runpod]'`."
-        ) from e
-    return sky
+            "RUNPOD_API_KEY is not set. "
+            "Get your API key from https://www.runpod.io/console/user/settings "
+            "and export it: export RUNPOD_API_KEY=your_key_here"
+        )
+    return key
 
 
-def _repair_empty_skypilot_catalogs(log: Callable[[str], object] | None = None) -> None:
-    """Delete empty SkyPilot catalog CSV caches so SkyPilot can refetch them."""
-    catalog_root = pathlib.Path.home() / ".sky" / "catalogs"
-    if not catalog_root.exists():
-        return
-
-    repaired = []
-    for path in catalog_root.glob("*/*/*.csv"):
-        try:
-            if path.is_file() and path.stat().st_size == 0:
-                path.unlink()
-                repaired.append(path)
-        except OSError:
-            continue
-
-    if repaired and log is not None:
-        paths = ", ".join(str(path) for path in repaired)
-        log(f"Removed empty SkyPilot catalog cache file(s): {paths}")
+def _runpod_headers() -> dict[str, str]:
+    return {"Authorization": f"Bearer {_get_runpod_api_key()}"}
 
 
-def _wait_for_request(sky: Any, request_id: Any, *, stream: bool = True) -> tuple[Any, str]:
-    """Wait for a SkyPilot SDK request and capture streamed logs when possible."""
-    if request_id is None:
-        return None, ""
+def _ensure_ssh_key() -> tuple[str, str]:
+    """Ensure an SSH key pair exists for RunPod pods.
 
-    buf = io.StringIO()
-    if stream and hasattr(sky, "stream_and_get"):
-        try:
-            result = sky.stream_and_get(request_id, output_stream=buf)
-            return result, _strip_ansi(buf.getvalue())
-        except TypeError:
-            # Older SDKs may not support output_stream.
-            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
-                result = sky.stream_and_get(request_id)
-            return result, _strip_ansi(buf.getvalue())
+    Returns:
+        (private_key_path, public_key_string)
+    """
+    key_dir = pathlib.Path.home() / ".ssh"
+    key_dir.mkdir(mode=0o700, exist_ok=True)
+    priv_path = key_dir / _SSH_KEY_NAME
+    pub_path = key_dir / f"{_SSH_KEY_NAME}.pub"
 
-    if hasattr(sky, "get"):
-        return sky.get(request_id), ""
-    return request_id, ""
+    if not priv_path.exists():
+        subprocess.run(
+            ["ssh-keygen", "-t", "ed25519", "-f", str(priv_path), "-N", "", "-q"],
+            check=True,
+            capture_output=True,
+        )
 
-
-def _request_succeeded(result: Any) -> bool:
-    """Best-effort success inference across SkyPilot SDK versions."""
-    if result is None:
-        return True
-    if isinstance(result, int):
-        return result == 0
-    if isinstance(result, tuple) and result and isinstance(result[0], int):
-        # sky.exec commonly returns (job_id, handle), not an exit code.
-        return True
-    return True
+    return str(priv_path), pub_path.read_text().strip()
 
 
-def _extract_job_id(result: Any) -> int | None:
-    if isinstance(result, tuple) and result and isinstance(result[0], int):
-        return result[0]
-    if isinstance(result, int) and result > 0:
-        return result
-    return None
+def _parse_hardware(hardware: str) -> tuple[str | None, int | None]:
+    """Parse hardware string like 'RTX4090:1' or 'A100-80GB:4'.
+
+    Returns:
+        (gpu_type, gpu_count) — both None if hardware is a CPU alias.
+    """
+    cpu = CPU_ALIASES.get(hardware)
+    if cpu is not None:
+        return None, None
+    if ":" in hardware:
+        parts = hardware.rsplit(":", 1)
+        return parts[0], int(parts[1])
+    return hardware, 1
+
+
+def _create_runpod_pod(
+    name: str,
+    image_name: str,
+    gpu_type: str | None,
+    gpu_count: int | None,
+    ssh_pub_key: str,
+    env: dict[str, str] | None = None,
+) -> dict:
+    payload: dict[str, Any] = {
+        "name": name,
+        "imageName": image_name,
+        "containerDiskInGb": 20,
+        "env": dict(env or {}),
+        "dockerStartCmd": "sleep infinity",
+    }
+    payload["env"]["SSH_PUBLIC_KEY"] = ssh_pub_key
+
+    if gpu_type and gpu_count:
+        payload["gpuTypeIds"] = [gpu_type]
+        payload["gpuCount"] = gpu_count
+    else:
+        payload["computeType"] = "CPU"
+
+    resp = httpx.post(
+        f"{RUNPOD_API_BASE}/pods",
+        headers=_runpod_headers(),
+        json=payload,
+        timeout=30,
+    )
+    if resp.status_code == 401:
+        raise RuntimeError(
+            "RunPod API key rejected (401 Unauthorized). "
+            "Check your RUNPOD_API_KEY environment variable."
+        )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _get_runpod_pod(pod_id: str) -> dict:
+    resp = httpx.get(
+        f"{RUNPOD_API_BASE}/pods/{pod_id}",
+        headers=_runpod_headers(),
+        timeout=15,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _delete_runpod_pod(pod_id: str) -> None:
+    httpx.delete(
+        f"{RUNPOD_API_BASE}/pods/{pod_id}",
+        headers=_runpod_headers(),
+        timeout=15,
+    )
+
+
+def _stop_runpod_pod(pod_id: str) -> None:
+    httpx.post(
+        f"{RUNPOD_API_BASE}/pods/{pod_id}/stop",
+        headers=_runpod_headers(),
+        timeout=15,
+    )
+
+
+def _resume_runpod_pod(pod_id: str) -> None:
+    httpx.post(
+        f"{RUNPOD_API_BASE}/pods/{pod_id}/start",
+        headers=_runpod_headers(),
+        timeout=15,
+    )
+
+
+def _restart_runpod_pod(pod_id: str) -> None:
+    httpx.post(
+        f"{RUNPOD_API_BASE}/pods/{pod_id}/restart",
+        headers=_runpod_headers(),
+        timeout=15,
+    )
+
+
+def _wait_for_pod_running(pod_id: str, *, timeout: int = WAIT_TIMEOUT,
+                           poll_interval: float = 5.0,
+                           log: Callable[[str], object] | None = None) -> dict:
+    _log = log or (lambda _: None)
+    deadline = time.monotonic() + timeout
+    last_status = None
+    while time.monotonic() < deadline:
+        pod = _get_runpod_pod(pod_id)
+        status = pod.get("desiredStatus", "")
+        if status != last_status:
+            _log(f"Pod status: {status}")
+            last_status = status
+        if status == "RUNNING":
+            return pod
+        time.sleep(poll_interval)
+    raise TimeoutError(
+        f"RunPod pod {pod_id} did not reach RUNNING status within {timeout}s "
+        f"(last status: {last_status})"
+    )
+
+
+def _extract_pod_connection(pod: dict) -> tuple[str, int]:
+    """Extract IP and SSH port from a running pod's data."""
+    pod_ip = pod.get("ip") or pod.get("runtime", {}).get("ip")
+    if not pod_ip:
+        raise RuntimeError(f"Cannot determine pod IP from RunPod response: {pod.get('id', '?')}")
+    ssh_port = 22
+    ports = pod.get("ports") or pod.get("runtime", {}).get("ports", [])
+    for p in ports:
+        if isinstance(p, dict) and p.get("privatePort") == 22:
+            ssh_port = int(p.get("publicPort", 22))
+            break
+    return pod_ip, ssh_port
+
+
+# ── Remote Python scripts (sent via SSH) ──────────────────────────────
 
 
 def _remote_python_command(script: str, payload: dict[str, Any]) -> str:
@@ -166,7 +266,6 @@ for idx, line in enumerate(selected, start=start + 1):
         line = line[:4000] + "..."
     print(f"{idx}\t{line}")
 '''
-
 
 _WRITE_SCRIPT = r'''
 import ast, os, pathlib, tempfile
@@ -208,7 +307,6 @@ if pathlib.Path(path).suffix == ".py":
         msg += "\n\nValidation warnings:\n" + "\n".join(f"  ! {w}" for w in warnings)
 print(msg)
 '''
-
 
 _EDIT_SCRIPT = r'''
 import ast, os, pathlib, tempfile
@@ -322,11 +420,13 @@ if p.suffix == ".py":
 print(msg)
 '''
 
-
 _EXISTS_SCRIPT = r'''
 import pathlib
 print(str(pathlib.Path(payload["path"]).exists()).lower())
 '''
+
+
+# ── ToolResult ────────────────────────────────────────────────────────
 
 
 @dataclass
@@ -344,9 +444,12 @@ class ToolResult:
         return {"success": self.success, "output": self.output, "error": self.error}
 
 
+# ── Sandbox ───────────────────────────────────────────────────────────
+
+
 @dataclass
 class Sandbox:
-    """A handle to a SkyPilot sandbox cluster."""
+    """A handle to a RunPod sandbox pod."""
 
     space_id: str
     token: str | None = None
@@ -356,14 +459,12 @@ class Sandbox:
     hardware: str = "cpu-basic"
     _owns_space: bool = field(default=False, repr=False)
     _files_read: set[str] = field(init=False, repr=False, default_factory=set)
-    _latest_job_id: int | None = field(default=None, init=False, repr=False)
+    _pod_ip: str = field(default="", repr=False)
+    _pod_ssh_port: int = field(default=22, repr=False)
+    _ssh_key_path: str = field(default="", repr=False)
 
     class Cancelled(Exception):
         """Raised when sandbox creation is cancelled by the user."""
-
-    @property
-    def cluster_name(self) -> str:
-        return self.space_id
 
     @classmethod
     def create(
@@ -380,11 +481,8 @@ class Sandbox:
         cancel_event: "Any | None" = None,
         **_: Any,
     ) -> "Sandbox":
-        """Create a SkyPilot cluster and prepare it as a sandbox."""
-        del wait_timeout  # SkyPilot owns provisioning timeouts/retries.
+        """Create a RunPod pod and prepare it as a sandbox."""
         _log = log or print
-        _repair_empty_skypilot_catalogs(_log)
-        sky = _require_sky()
 
         def _check_cancel() -> None:
             if cancel_event and cancel_event.is_set():
@@ -394,50 +492,66 @@ class Sandbox:
         base = name or "ml-intern"
         suffix = uuid.uuid4().hex[:8]
         owner_part = f"{owner}-" if owner else ""
-        cluster_name = _sanitize_cluster_name(f"{base}-{owner_part}{suffix}")
-        resources = _make_resources(sky, hardware=hardware, infra=infra)
-        task_secrets = dict(secrets or {})
-        if token and "HF_TOKEN" not in task_secrets:
-            task_secrets["HF_TOKEN"] = token
+        pod_name = f"{base}-{owner_part}{suffix}"[:63]
 
-        ensure_app_dir = (
-            "(mkdir -p /app 2>/dev/null || sudo mkdir -p /app) && "
-            "(test -w /app || sudo chown -R \"$USER\":\"$USER\" /app)"
-        )
-        setup = (
-            f"{ensure_app_dir} && "
-            "python -m pip install --user -q --upgrade pip >/dev/null 2>&1 || true"
-        )
-        task = sky.Task(
-            name=cluster_name,
-            setup=setup,
-            run=f"{ensure_app_dir} && echo 'SkyPilot sandbox ready'",
-            secrets=task_secrets or None,
-        )
-        task.set_resources(resources)
+        gpu_type, gpu_count = _parse_hardware(hardware)
+        image_name = os.environ.get("RUNPOD_IMAGE_NAME", "runpod/pytorch:latest")
 
-        _log(f"Creating SkyPilot sandbox cluster: {cluster_name} ({infra}, {hardware})...")
+        _log(f"Ensuring SSH key for RunPod...")
+        ssh_key_path, ssh_pub_key = _ensure_ssh_key()
         _check_cancel()
-        request_id = sky.launch(
-            task,
-            cluster_name=cluster_name,
-            idle_minutes_to_autostop=45 if hardware not in CPU_ALIASES else None,
-            retry_until_up=True,
-            down=False,
-            _need_confirmation=False,
-        )
+
+        task_env: dict[str, str] = {}
+        if token:
+            task_env["HF_TOKEN"] = token
+        if secrets:
+            task_env.update(secrets)
+
+        _log(f"Creating RunPod pod: {pod_name} ({hardware})...")
         _check_cancel()
-        _wait_for_request(sky, request_id, stream=True)
+        try:
+            pod_data = _create_runpod_pod(
+                name=pod_name,
+                image_name=image_name,
+                gpu_type=gpu_type,
+                gpu_count=gpu_count,
+                ssh_pub_key=ssh_pub_key,
+                env=task_env,
+            )
+        except httpx.HTTPStatusError as e:
+            raise RuntimeError(f"RunPod API error: {e.response.status_code} {e.response.text}") from e
+
+        pod_id = pod_data.get("id") or pod_data.get("pod", {}).get("id", "")
+        if not pod_id:
+            raise RuntimeError(f"RunPod did not return a pod ID: {pod_data}")
+
+        _log(f"Waiting for pod {pod_id} to reach RUNNING status...")
         _check_cancel()
+        try:
+            pod = _wait_for_pod_running(pod_id, timeout=wait_timeout, log=_log)
+        except TimeoutError:
+            _log("Pod did not become ready in time. Cleaning up...")
+            try:
+                _delete_runpod_pod(pod_id)
+            except Exception:
+                pass
+            raise
+
+        _check_cancel()
+        pod_ip, ssh_port = _extract_pod_connection(pod)
+
+        _log(f"RunPod sandbox ready: {pod_id} ({pod_ip}:{ssh_port})")
 
         sb = cls(
-            space_id=cluster_name,
+            space_id=pod_id,
             token=token,
             infra=infra,
             hardware=hardware,
             _owns_space=True,
+            _pod_ip=pod_ip,
+            _pod_ssh_port=ssh_port,
+            _ssh_key_path=ssh_key_path,
         )
-        _log(f"SkyPilot sandbox ready: {cluster_name}")
         return sb
 
     @classmethod
@@ -454,35 +568,27 @@ class Sandbox:
         if not self._owns_space:
             raise RuntimeError(
                 f"This Sandbox did not create {self.space_id}. "
-                "Use SkyPilot directly if you are sure you want to delete it."
+                "Use RunPod directly if you are sure you want to delete it."
             )
-        sky = _require_sky()
-        request_id = sky.down(self.cluster_name)
-        _wait_for_request(sky, request_id, stream=True)
+        _delete_runpod_pod(self.space_id)
 
     def pause(self) -> None:
-        sky = _require_sky()
-        if hasattr(sky, "stop"):
-            request_id = sky.stop(self.cluster_name)
-            _wait_for_request(sky, request_id, stream=True)
-            return
-        raise RuntimeError("This SkyPilot SDK does not expose sky.stop().")
+        _stop_runpod_pod(self.space_id)
 
     def restart(self) -> None:
-        self.bash("true")
+        _restart_runpod_pod(self.space_id)
+        pod = _wait_for_pod_running(self.space_id, timeout=WAIT_TIMEOUT)
+        self._pod_ip, self._pod_ssh_port = _extract_pod_connection(pod)
 
     @property
     def url(self) -> str:
-        return f"skypilot://{self.cluster_name}"
+        return f"https://www.runpod.io/console/pods/{self.space_id}"
 
     @property
     def status(self) -> str:
-        sky = _require_sky()
-        if not hasattr(sky, "status"):
-            return "unknown"
         try:
-            result, _ = _wait_for_request(sky, sky.status(self.cluster_name), stream=False)
-            return str(result)
+            pod = _get_runpod_pod(self.space_id)
+            return pod.get("desiredStatus", "unknown")
         except Exception:
             return "unknown"
 
@@ -497,45 +603,67 @@ class Sandbox:
                 print(f"Warning: failed to delete sandbox: {e}", file=sys.stderr)
 
     def _exec(self, command: str, *, timeout: int | None = None) -> ToolResult:
-        sky = _require_sky()
+        import paramiko
+
         effective_timeout = min(timeout or self.timeout, MAX_TIMEOUT)
-        task = sky.Task(
-            name=f"{self.cluster_name}-cmd",
-            run=command,
-            envs={
-                "HF_TOKEN": self.token or os.environ.get("HF_TOKEN", ""),
-                "UV_NO_PROGRESS": "1",
-                "HF_HUB_DISABLE_PROGRESS_BARS": "1",
-                "TQDM_DISABLE": "1",
-            },
-        )
-        request_id = sky.exec(task, cluster_name=self.cluster_name, down=False)
+
         try:
-            result, logs = _wait_for_request(sky, request_id, stream=True)
+            key = paramiko.Ed25519Key.from_private_key_file(self._ssh_key_path)
+        except paramiko.ssh_exception.SSHException:
+            key = paramiko.RSAKey.from_private_key_file(self._ssh_key_path)
+
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+        try:
+            client.connect(
+                hostname=self._pod_ip,
+                port=self._pod_ssh_port,
+                username="root",
+                pkey=key,
+                timeout=15,
+                banner_timeout=30,
+            )
+
+            env_vars = (
+                f"HF_TOKEN={shlex.quote(self.token or os.environ.get('HF_TOKEN', ''))} "
+                "UV_NO_PROGRESS=1 "
+                "HF_HUB_DISABLE_PROGRESS_BARS=1 "
+                "TQDM_DISABLE=1"
+            )
+            wrapped = (
+                f"cd {shlex.quote(self.work_dir)} && "
+                f"export {env_vars} && "
+                f"timeout {effective_timeout}s bash -lc {shlex.quote(command)}"
+            )
+
+            chan = client.get_transport().open_session(timeout=effective_timeout)
+            chan.set_combine_stderr(True)
+            chan.exec_command(wrapped)
+
+            stdout_buf = io.StringIO()
+            while True:
+                if chan.exit_status_ready():
+                    break
+                if chan.recv_ready():
+                    data = chan.recv(4096).decode(errors="replace")
+                    stdout_buf.write(data)
+
+            # Drain remaining data
+            while chan.recv_ready():
+                stdout_buf.write(chan.recv(4096).decode(errors="replace"))
+
+            exit_code = chan.recv_exit_status()
+            output = _truncate_output(stdout_buf.getvalue().strip())
+
+            if exit_code == 0:
+                return ToolResult(success=True, output=output or "(no output)")
+            return ToolResult(success=False, output=output, error=f"Exit code {exit_code}")
+
         except Exception as e:
             return ToolResult(success=False, output="", error=str(e))
-        self._latest_job_id = _extract_job_id(result)
-        exit_code = 0
-        if self._latest_job_id is not None and hasattr(sky, "tail_logs"):
-            log_buf = io.StringIO()
-            try:
-                tail_result = sky.tail_logs(
-                    self.cluster_name,
-                    self._latest_job_id,
-                    follow=True,
-                    output_stream=log_buf,
-                )
-                if isinstance(tail_result, int):
-                    exit_code = tail_result
-            except Exception as e:
-                output = _truncate_output((logs + "\n" + log_buf.getvalue()).strip())
-                return ToolResult(success=False, output=output, error=str(e))
-            logs = log_buf.getvalue() or logs
-        output = _truncate_output(logs.strip())
-        success = _request_succeeded(result) and exit_code == 0
-        if success:
-            return ToolResult(success=True, output=output or "(no output)")
-        return ToolResult(success=False, output=output, error=f"Exit code {exit_code}")
+        finally:
+            client.close()
 
     def bash(
         self,
@@ -621,20 +749,12 @@ class Sandbox:
         )
 
     def kill_all(self) -> ToolResult:
-        sky = _require_sky()
-        if self._latest_job_id is not None and hasattr(sky, "cancel"):
-            try:
-                request_id = sky.cancel(self.cluster_name, job_ids=[self._latest_job_id])
-                _wait_for_request(sky, request_id, stream=True)
-                return ToolResult(success=True, output=f"Cancelled SkyPilot job {self._latest_job_id}")
-            except Exception as e:
-                return ToolResult(success=False, error=str(e))
         return self.bash("pkill -TERM -u \"$USER\" || true", timeout=30)
 
     TOOLS = {
         "bash": {
             "description": (
-                "Run a shell command in the remote SkyPilot sandbox and return stdout/stderr.\n"
+                "Run a shell command in the remote RunPod sandbox and return stdout/stderr.\n"
                 "\n"
                 "IMPORTANT: Do NOT use bash for file operations - use the dedicated tools instead:\n"
                 "- To read files: use read (not cat/head/tail)\n"
@@ -668,7 +788,7 @@ class Sandbox:
         },
         "read": {
             "description": (
-                "Reads a file from the SkyPilot sandbox filesystem. Returns contents "
+                "Reads a file from the RunPod sandbox filesystem. Returns contents "
                 "with line numbers (cat -n format).\n"
                 "\n"
                 "Usage:\n"
@@ -693,7 +813,7 @@ class Sandbox:
         },
         "write": {
             "description": (
-                "Writes a file to the SkyPilot sandbox filesystem. Overwrites the "
+                "Writes a file to the RunPod sandbox filesystem. Overwrites the "
                 "existing file if one exists at the path.\n"
                 "\n"
                 "- If this is an existing file, you MUST use the read tool first.\n"
@@ -712,7 +832,7 @@ class Sandbox:
         },
         "edit": {
             "description": (
-                "Performs string replacements in files on the SkyPilot sandbox. "
+                "Performs string replacements in files on the RunPod sandbox. "
                 "Supports exact matching with fuzzy fallback.\n"
                 "\n"
                 "Usage:\n"
@@ -770,22 +890,3 @@ class Sandbox:
         if not fn:
             return ToolResult(success=False, error=f"Unknown tool: {name}")
         return fn(arguments)
-
-
-def _sanitize_cluster_name(name: str) -> str:
-    cleaned = re.sub(r"[^a-zA-Z0-9-]", "-", name).strip("-").lower()
-    cleaned = re.sub(r"-+", "-", cleaned)
-    return cleaned[:63] or f"ml-intern-{uuid.uuid4().hex[:8]}"
-
-
-def _make_resources(sky: Any, *, hardware: str, infra: str) -> Any:
-    kwargs: dict[str, Any] = {"infra": infra}
-    if infra.lower().startswith("runpod"):
-        # RunPod rejects the larger disk default SkyPilot otherwise selects.
-        kwargs["disk_size"] = 20
-    cpu = CPU_ALIASES.get(hardware)
-    if cpu is not None:
-        kwargs.update(cpu)
-    else:
-        kwargs["accelerators"] = hardware
-    return sky.Resources(**kwargs)

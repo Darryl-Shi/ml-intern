@@ -1,5 +1,5 @@
 """
-Sandbox tools — expose the Sandbox client as agent tools.
+Sandbox tools — expose the RunPod Sandbox client as agent tools.
 
 5 tools total:
   sandbox_create — explicit RunPod sandbox creation (requires approval)
@@ -87,7 +87,7 @@ async def _ensure_sandbox(
             data={
                 "tool": "sandbox",
                 "log": (
-                    "Auto-creating SkyPilot sandbox "
+                    "Auto-creating RunPod sandbox "
                     f"({create_kwargs.get('infra', 'runpod')}, {hardware})..."
                 ),
             },
@@ -151,7 +151,7 @@ async def _ensure_sandbox(
             event_type="tool_log",
             data={
                 "tool": "sandbox",
-                "log": f"SkyPilot sandbox ready: {sb.space_id} ({sb.url})",
+                "log": f"RunPod sandbox ready: {sb.space_id} ({sb.url})",
             },
         )
     )
@@ -161,11 +161,9 @@ async def _ensure_sandbox(
 
 @lru_cache(maxsize=1)
 def _runpod_hardware_options() -> list[str]:
-    """RunPod GPU options in SkyPilot accelerator syntax.
+    """RunPod GPU options in GPU:count syntax.
 
-    Keep this list RunPod-specific. Do not scrape ``sky show-gpus -a`` here:
-    that command returns SkyPilot's global accelerator catalog across clouds,
-    which leaks irrelevant infrastructure choices into the MCP schema.
+    Keep this list RunPod-specific.
     """
     gpu_families = {
         "RTX3070",
@@ -204,7 +202,7 @@ def _hardware_schema() -> dict[str, Any]:
     return {
         "type": "string",
         "description": (
-            "RunPod GPU accelerator in SkyPilot syntax (default: RTX4090:1). "
+            "RunPod GPU accelerator (default: RTX4090:1). "
             "Use RunPod GPU families such as RTX4090:1, L40S:1, A40:1, "
             "A100-80GB:1, H100:1, H200:1. For multiple GPUs, change the suffix "
             "where supported, e.g. L40S:2 or A100-80GB:4."
@@ -217,7 +215,7 @@ def _base_hardware_schema() -> dict[str, Any]:
     return {
         "type": "string",
         "description": (
-            "RunPod GPU accelerator in SkyPilot syntax (default: RTX4090:1). "
+            "RunPod GPU accelerator (default: RTX4090:1). "
             "Examples: RTX4090:1, L40S:1, A40:1, A100-80GB:1, H100:1, H200:1."
         ),
     }
@@ -228,10 +226,10 @@ def _base_hardware_schema() -> dict[str, Any]:
 SANDBOX_CREATE_TOOL_SPEC = {
     "name": "sandbox_create",
     "description": (
-        "Create a persistent SkyPilot sandbox on RunPod for developing and testing scripts.\n\n"
+        "Create a persistent RunPod sandbox for developing and testing scripts.\n\n"
         "Workflow: sandbox_create -> write script -> pip install -> test with small run -> fix errors -> run the full job in the sandbox.\n"
         "The sandbox persists across tool calls within the session. pip install works out of the box.\n\n"
-        "Use this when: you need to develop, test, iterate on, or run ML scripts on SkyPilot/RunPod. "
+        "Use this when: you need to develop, test, iterate on, or run ML scripts on RunPod. "
         "Especially for training scripts where you need to verify imports, test on a small subset, and fix errors interactively.\n\n"
         "Skip this when: the task is a simple one-shot operation (status check, resource search, quick data query), "
         "or the script is copied from a verified working example with minimal changes.\n\n"
@@ -241,7 +239,7 @@ SANDBOX_CREATE_TOOL_SPEC = {
         "fp32 ≈ 4 bytes/param, plus ~20% overhead for optimizer states during training.\n"
         "Common RunPod picks: RTX4090:1 (24GB VRAM, small models/prototyping), L40S:1 (48GB, medium workloads), A100-80GB:1 or H100:1 (80GB, larger training/inference). "
         "If the model won't fit, pick larger hardware upfront — OOM on a sandbox wastes time.\n\n"
-        "Hardware uses SkyPilot accelerator syntax for RunPod GPUs. The infra is fixed to RunPod.\n"
+        "The infra is fixed to RunPod.\n"
     ),
     "parameters": {
         "type": "object",
@@ -293,14 +291,11 @@ async def sandbox_create_handler(
 
 def _format_create_error(error: Exception) -> str:
     message = str(error)
-    if "500 Server Error" in message and "/launch" in message:
+    if "401" in message and "Unauthorized" in message:
         return (
             f"{message}\n\n"
-            "SkyPilot's local API server returned an internal error while "
-            "handling the launch request. Try restarting it with "
-            "`uv run sky api stop` followed by `uv run sky api start`, then "
-            "call sandbox_create again. Server logs are in "
-            "`~/.sky/api_server/server.log`."
+            "RunPod API key rejected. Make sure RUNPOD_API_KEY is set correctly. "
+            "Get your key from https://www.runpod.io/console/user/settings"
         )
     return message
 
